@@ -116,7 +116,9 @@ class SheetCard(ctk.CTkFrame):
                     self.filter_menu.set(label)
                     break
         self._refresh_antibiotics()
-        self.ab_var.trace_add("changed", lambda *_: self._refresh_antibiotics())
+        # В Tk режим трассировки называется "write" (а не "changed") — иначе
+        # создание карточки падало с TclError и кнопка «Добавить лист» не работала.
+        self.ab_var.trace_add("write", lambda *_: self._refresh_antibiotics())
 
     # ------------------------------------------------------------------
     def _refresh_antibiotics(self):
@@ -197,6 +199,9 @@ class SheetBuilderDialog(ctk.CTkToplevel):
         ctk.CTkButton(preset_bar, text="📂 Загрузить пресет…", width=150, height=30,
                       fg_color="transparent", border_width=1,
                       command=self._load_preset).pack(side="left", padx=4)
+        ctk.CTkButton(preset_bar, text="🔄 Антибиотики", width=130, height=30,
+                      fg_color="transparent", border_width=1,
+                      command=self._refresh_all_antibiotics).pack(side="left", padx=4)
 
         # Скроллируемая область карточек
         self.scroll = ctk.CTkScrollableFrame(self)
@@ -221,19 +226,49 @@ class SheetBuilderDialog(ctk.CTkToplevel):
 
     # ------------------------------------------------------------------
     def _add_card(self, spec=None):
-        card = SheetCard(self.scroll, len(self._cards), spec=spec,
-                         antibiotics_getter=self._antibiotics_getter,
-                         on_delete=self._remove_card)
-        card.pack(fill="x", pady=6)
-        self._cards.append(card)
+        try:
+            card = SheetCard(self.scroll, len(self._cards), spec=spec,
+                             antibiotics_getter=self._antibiotics_getter,
+                             on_delete=self._remove_card)
+            card.pack(fill="x", pady=6)
+            self._cards.append(card)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось создать карточку листа: {e}",
+                                 parent=self)
+
+    def _refresh_all_antibiotics(self):
+        """Обновляет список антибиотиков во всех карточках."""
+        n = 0
+        for c in self._cards:
+            try:
+                c._refresh_antibiotics()
+                n += 1
+            except Exception:
+                pass
+        abs_list = []
+        try:
+            abs_list = list(self._antibiotics_getter())
+        except Exception:
+            pass
+        if abs_list:
+            messagebox.showinfo("Антибиотики",
+                                f"Загружено антибиотиков: {len(abs_list)} "
+                                f"(обновлено карточек: {n}).", parent=self)
+        else:
+            messagebox.showwarning(
+                "Антибиотики",
+                "Список пуст. Убедитесь, что исходный файл выбран на главном окне.",
+                parent=self)
 
     def _remove_card(self, card):
         if card in self._cards:
             self._cards.remove(card)
-        card.destroy()
-
-    def _renumber(self):
-        pass  # индексы используются только для имён по умолчанию
+        try:
+            card.destroy()
+        except Exception:
+            pass
+        # переиндексация оставшихся карточек не требуется — имена по умолчанию
+        # фиксируются при создании
 
     def _apply(self):
         specs = [c.get_spec() for c in self._cards]

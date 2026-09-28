@@ -108,41 +108,72 @@ def find_header_row(df_raw):
     return best_idx
 
 
+_AB_SERVICE_TOKENS = {'nan', 'none', 'rsi', 's', 'i', 'r', 'нд', 'nd', 's/i/r', 'si r',
+                      's i r', 's/i/r/нд', 'чувствительность', 'резистентность',
+                      'антибиотик', 'antibiotic', 'микроорганизм', 'микробиология',
+                      'заказ', 'история', 'история болезни', 'дата', 'материал',
+                      'фио', 'fio', 'patient', 'material', 'date', 'organism',
+                      'номер', '№', 'id', 'прочее', 'диагностика', 'выделено',
+                      'рост', 'посев', 'лаборатория', 'врач', 'отделение', 'клиника',
+                      'пол', 'возраст', 'адрес', 'направление', 'примечание'}
+
+
 def detect_ab_name_row(df_raw, organism_pos, header_row_idx, log_func=None):
     """Автоопределение строки с названиями антибиотиков.
 
-    Не требуется, чтобы названия лежали в фиксированной 7-й строке: ищем строку
-    (в пределах ~25 строк от начала), содержащую максимум текстовых значений
-    в области столбцов антибиотиков.
+    Штатное расположение — на одну строку ВЫШЕ заголовков таблицы
+    (например, заголовки на 8-й строке Excel — названия антибиотиков на 7-й).
+    Поэтому сначала проверяется именно строка над заголовками; если названий
+    в ней не найдено, перебираются соседние строки выше и ниже заголовков.
+    Служебные слова («RSI», «Дата», «ФИО» и т.п.) названиями не считаются.
     """
     ncols = df_raw.shape[1]
     start = organism_pos + 1
     if start >= ncols:
-        return header_row_idx
+        return max(header_row_idx - 1, 0)
 
     def count_names(r):
-        cnt = 0
+        if r < 0 or r >= len(df_raw):
+            return 0, []
+        cnt, cols = 0, []
         for j in range(start, ncols):
             v = df_raw.iat[r, j]
             if pd.notna(v):
                 s = str(v).strip()
-                if s and not s.isdigit() and _norm(s) not in ('nan', 'none', 'rsi', 's', 'i', 'r', 'нд'):
+                n = _norm(s)
+                if (s and not s.isdigit() and n not in _AB_SERVICE_TOKENS
+                        and '/' not in s and '\n' not in s):
                     cnt += 1
-        return cnt
+                    cols.append(j)
+        return cnt, cols
 
+    # 1) Основной кандидат — строка на 1 выше заголовков
+    above = header_row_idx - 1
+    cnt_above, cols_above = count_names(above)
+    if cnt_above >= 2:
+        if log_func:
+            log_func(f"Названия антибиотиков взяты из строки №{above + 1} "
+                     f"(на 1 строку выше заголовков, найдено {cnt_above} названий)")
+        return above
+
+    # 2) Запасной вариант — поиск среди соседних строк (выше приоритетнее)
     best_r, best_c = None, 0
-    for r in range(0, min(len(df_raw), max(header_row_idx + 2, 26))):
-        c = count_names(r)
+    offsets = [-2, -3, 1, 2, 3, 4, 5]
+    for off in offsets:
+        r = header_row_idx + off
+        c, _ = count_names(r)
         if c > best_c:
             best_r, best_c = r, c
-    if best_c >= 3 and best_r is not None:
+    if best_c >= 2 and best_r is not None:
         if log_func:
-            log_func(f"Строка с названиями антибиотиков определена автоматически: №{best_r + 1}")
+            log_func(f"Строка с названиями антибиотиков определена автоматически: "
+                     f"№{best_r + 1} (найдено {best_c} названий)")
         return best_r
+
     if log_func:
         log_func("Не удалось уверенно найти строку с названиями антибиотиков — "
-                 "используем строку сразу под заголовками.")
-    return min(header_row_idx + 1, len(df_raw) - 1)
+                 "используется строка на 1 выше заголовков.")
+    return max(above, 0)
 
 
 def load_data(filepath, log_func=None):
@@ -284,20 +315,31 @@ def load_data(filepath, log_func=None):
 
     antibiotics = []
     ab_indices = []
-    for j in range(organism_pos + 1, len(data.columns), 2):
-        if j+1 >= len(data.columns):
-            break
-        ab_name_raw = df_raw.iloc[ab_name_row, j] if ab_name_row < len(df_raw) else ''
+    taken_rsi = set()
+    for j in range(organism_pos + 1, len(data.columns) - 1):
+        # Название антибиотика ищем в строке НАД заголовками таблицы
+        # (например, заголовки на 8-й строке — названия на 7-й).
+        ab_name_raw = df_raw.iloc[ab_name_row, j] if 0 <= ab_name_row < len(df_raw) else ''
         ab_name = str(ab_name_raw).strip()
-        if not ab_name or ab_name.lower() in ('nan', 'none', ''):
-            ab_name_raw = df_raw.iloc[ab_name_row, j+1] if ab_name_row < len(df_raw) else ''
-            ab_name = str(ab_name_raw).strip()
-        if ab_name and ab_name.lower() not in ('nan', 'none', ''):
-            ab_name_clean = ab_name
-            if (ab_name_clean and not ab_name_clean.isdigit()
-                and ab_name_clean not in ('RSI', 'S', 'R', 'I', 'НД', 'Unnamed', 'ФИО', 'material_raw')):
-                antibiotics.append(ab_name_clean)
-                ab_indices.append(j+1)  # индекс RSI (правый столбец)
+        if not ab_name or _norm(ab_name) in _AB_SERVICE_TOKENS or ab_name.isdigit():
+            continue
+        # Столбец с результатами RSI — ближайшая колонка справа от названия,
+        # содержащая значения S/I/R/НД среди данных (каждый столбец
+        # используется только один раз)
+        rsi_idx = None
+        for k in range(j + 1, min(j + 3, len(data.columns))):
+            if k in taken_rsi:
+                continue
+            vals = {str(v).strip().upper() for v in data.iloc[:60, k].dropna().tolist()
+                    if isinstance(v, str)}
+            if vals & {'S', 'I', 'R', 'НД'}:
+                rsi_idx = k
+                break
+        if rsi_idx is None:
+            continue
+        antibiotics.append(ab_name)
+        ab_indices.append(rsi_idx)
+        taken_rsi.add(rsi_idx)
 
     if log_func:
         log_func(f"Найдено антибиотиков: {len(antibiotics)}. Примеры: {antibiotics[:10]}")
@@ -966,15 +1008,11 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
         log_func("Формирование листа 3 (общая антибиотикорезистентность)...")
     sheet4 = generate_antibiotic_sheet(ab_data, log_func=log_func)
 
-    if log_func:
-        log_func("Формирование листа «Раны (антибиотики)»...")
-    sheet5, wound_data = build_wound_sheet5(data, antibiotics, ab_indices, log_func=log_func)
-
     # Листы конструктора
     built_sheets = {}
     if extra_sheets:
         base = prepare_base_table(df_main, data)
-        used_names = {'1', '2', '3', 'Раны (антибиотики)'}
+        used_names = {'1', '2', '3'}
         for n, spec in enumerate(extra_sheets, start=1):
             errs = validate_spec(spec, available_antibiotics=antibiotics)
             if errs:
@@ -992,29 +1030,29 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                 used_names.add(nm)
                 built_sheets[nm] = df_sheet
 
-    save_to_excel(sheet2, sheet3, sheet4, sheet5, output_path,
+    save_to_excel(sheet2, sheet3, sheet4, output_path,
                   log_func=log_func, styled=styled,
-                  raw_data=data, wound_data=wound_data,
+                  raw_data=data,
                   user_sheets=built_sheets)
 
     if log_func:
         log_func("Обработка успешно завершена!")
     return dict(df_main=df_main, ab_data=ab_data, sheet2=sheet2, sheet3=sheet3,
-                sheet4=sheet4, sheet5=sheet5, user_sheets=built_sheets)
+                sheet4=sheet4, user_sheets=built_sheets)
 
 # ----------------------------------------------------------------------
 # 8. Сохранение в Excel
 # ----------------------------------------------------------------------
 
-def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, sheet5_df, output_file,
+def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                   log_func=None, styled=False, raw_data=None, wound_data=None,
                   user_sheets=None):
     """
     Сохраняет аналитические листы в Excel.
     Первые три листа всегда базовые: «1» (анализ посевов), «2» (эпидемиология),
-    «3» (резистентность). Дополнительно сохраняются лист «Раны (антибиотики)»,
-    листы конструктора (user_sheets — dict {имя: DataFrame}) и при styled=True —
-    «Сводка» и «Данные».
+    «3» (резистентность). Остальные листы добавляются конструктором
+    (user_sheets — dict {имя: DataFrame}); при styled=True дополнительно
+    создаются справочные листы «Сводка» и «Данные».
     styled=True — современное оформление (шапки, зебра, заморозка панелей,
     условное форматирование % чувствительности).
     """
@@ -1049,10 +1087,6 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, sheet5_df, output_file,
         if not sheet4_df.empty:
             sheet4_df.to_excel(writer, sheet_name='3', index=False, header=False)
 
-        # Лист «Раны (антибиотики)» (ранее — лист 5)
-        if not sheet5_df.empty:
-            sheet5_df.to_excel(writer, sheet_name='Раны (антибиотики)', index=False, header=False)
-
         # Листы конструктора
         for name, df_sheet in user_sheets.items():
             df_sheet.to_excel(writer, sheet_name=name[:31], index=False)
@@ -1066,7 +1100,7 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, sheet5_df, output_file,
             if raw_data is not None and not raw_data.empty:
                 _write_raw_sheet(raw_data, writer)
                 extra_sheets.append('Данные')
-            _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_sheets)
+            _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets)
 
         else:
             # Автонастройка ширины столбцов (как в базовой версии)
@@ -1134,12 +1168,11 @@ def _write_raw_sheet(raw_data, writer):
     out.to_excel(writer, sheet_name='Данные', index=False)
 
 
-def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_sheets):
+def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets):
     """Современное оформление книги: шапки, зебра, числовые форматы, панели.
 
     extra_sheets — имена дополнительных листов (конструктор, «Сводка», «Данные»),
-    оформляемых как простые таблицы с шапкой; для листа «Раны (антибиотики)»
-    применяется блочное оформление антибиотикограмм."""
+    оформляемых как простые таблицы с шапкой."""
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.formatting.rule import CellIsRule
     from openpyxl.utils import get_column_letter as gcl
@@ -1252,8 +1285,8 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_s
                 r += 1
         autofit(ws)
 
-    # --- Листы «3» и «Раны (антибиотики)»: блоки «Антибиотик: ...» --------
-    for name, block_df in (('3', sheet4_df), ('Раны (антибиотики)', sheet5_df)):
+    # --- Лист «3»: блоки «Антибиотик: ...» --------
+    for name, block_df in (('3', sheet4_df),):
         if name not in writer.sheets or block_df is None or block_df.empty:
             continue
         ws = writer.sheets[name]
