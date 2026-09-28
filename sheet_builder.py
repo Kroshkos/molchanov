@@ -190,21 +190,41 @@ class SheetCard(ctk.CTkFrame):
         # имя -> ключ (без коллизий: реальное название не перезапишет спецключ)
         self._ab_key = {all_disp: AB_ALL_KEY}
         display_values = [all_disp]
+
+        def _free_name(name):
+            """Возвращает отображаемое имя, не занятое другим пунктом меню."""
+            if name not in self._ab_key:
+                return name
+            k = 2
+            while f"{name} ({k})" in self._ab_key:
+                k += 1
+            return f"{name} ({k})"
+
         for a in abs_list:
-            if a and a != AB_ALL_LABEL and a not in self._ab_key:
-                self._ab_key[a] = a
-                display_values.append(a)
+            if not a or a == AB_ALL_KEY:
+                continue
+            # реальный антибиотик с именем «Все антибиотики» не должен
+            # сливаться со служебным пунктом — даём ему уникальную метку
+            disp = _free_name(f"{a} ⭐") if a == AB_ALL_LABEL else _free_name(a)
+            self._ab_key[disp] = a
+            display_values.append(disp)
         self.antibiotic_menu.configure(values=display_values)
         # восстановление выбранного значения
         want_key = getattr(self, "_pending_ab", None) or \
             self._ab_key.get(self.antibiotic_menu.get(), "")
         if want_key and want_key in self._ab_key.values():
-            disp = all_disp if want_key == AB_ALL_KEY else want_key
+            disp = next((d for d, k in self._ab_key.items() if k == want_key),
+                        all_disp)
             self.antibiotic_menu.set(disp)
             self._pending_ab = None
         elif abs_list:
-            first = next((a for a in abs_list if a in self._ab_key), None)
-            self.antibiotic_menu.set(first if first else all_disp)
+            first = next((a for a in abs_list
+                          if any(k == a for k in self._ab_key.values())), None)
+            if first is not None:
+                disp = next(d for d, k in self._ab_key.items() if k == first)
+                self.antibiotic_menu.set(disp)
+            else:
+                self.antibiotic_menu.set(all_disp)
         else:
             self.antibiotic_menu.set(all_disp)
 
