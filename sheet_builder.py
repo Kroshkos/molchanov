@@ -176,37 +176,55 @@ class SheetCard(ctk.CTkFrame):
 
     def _refresh_antibiotics(self):
         """Заполняет список антибиотиков из исходного файла.
-        Первым пунктом всегда идёт «Все антибиотики» (суммарная АБГ)."""
+        Первым пунктом всегда идёт «Все антибиотики» (суммарная АБГ).
+
+        Меню хранит только отображаемые имена; сопоставление имени с ключом
+        антибиотика ведёт словарь self._ab_key (ранее использовался хак со
+        скрытыми символами в значении, который ломал карточку при открытии).
+        """
         try:
             abs_list = list(self._antibiotics_getter())
         except Exception:
             abs_list = []
-        # значения с суффиксом-меткой, чтобы исключить коллизию реального
-        # антибиотика со служебным ключом AB_ALL_KEY
-        self._ab_disp = {}          # отображаемое имя -> значение в меню
-        self._ab_key = {}           # значение в меню -> настоящий ключ
         all_disp = f"⭐ {AB_ALL_LABEL}"
-        all_val = f"{AB_ALL_KEY}\t{all_disp}"
-        self._ab_disp[all_disp] = all_val
-        self._ab_key[all_val] = AB_ALL_KEY
-        values = [all_val]
+        # имя -> ключ (без коллизий: реальное название не перезапишет спецключ)
+        self._ab_key = {all_disp: AB_ALL_KEY}
+        display_values = [all_disp]
+
+        def _free_name(name):
+            """Возвращает отображаемое имя, не занятое другим пунктом меню."""
+            if name not in self._ab_key:
+                return name
+            k = 2
+            while f"{name} ({k})" in self._ab_key:
+                k += 1
+            return f"{name} ({k})"
+
         for a in abs_list:
-            if a not in self._ab_disp:
-                val = f"{a}\t{a}"
-                self._ab_disp[a] = val
-                self._ab_key[val] = a
-                values.append(val)
-        self.antibiotic_menu.configure(values=[self._ab_disp[k] for k in
-                                               ([AB_ALL_LABEL] + abs_list)])
+            if not a or a == AB_ALL_KEY:
+                continue
+            # реальный антибиотик с именем «Все антибиотики» не должен
+            # сливаться со служебным пунктом — даём ему уникальную метку
+            disp = _free_name(f"{a} ⭐") if a == AB_ALL_LABEL else _free_name(a)
+            self._ab_key[disp] = a
+            display_values.append(disp)
+        self.antibiotic_menu.configure(values=display_values)
         # восстановление выбранного значения
         want_key = getattr(self, "_pending_ab", None) or \
             self._ab_key.get(self.antibiotic_menu.get(), "")
         if want_key and want_key in self._ab_key.values():
-            disp = all_disp if want_key == AB_ALL_KEY else want_key
+            disp = next((d for d, k in self._ab_key.items() if k == want_key),
+                        all_disp)
             self.antibiotic_menu.set(disp)
             self._pending_ab = None
         elif abs_list:
-            self.antibiotic_menu.set(abs_list[0])
+            first = next((a for a in abs_list
+                          if any(k == a for k in self._ab_key.values())), None)
+            if first is not None:
+                disp = next(d for d, k in self._ab_key.items() if k == first)
+                self.antibiotic_menu.set(disp)
+            else:
+                self.antibiotic_menu.set(all_disp)
         else:
             self.antibiotic_menu.set(all_disp)
 
@@ -214,10 +232,7 @@ class SheetCard(ctk.CTkFrame):
         """Возвращает ключ выбранного антибиотика (AB_ALL_KEY для «всех»,
         '' — если выбор некорректен)."""
         sel = self.antibiotic_menu.get()
-        labels = getattr(self, "_ab_disp", {})
-        if sel in labels:
-            return self._ab_key.get(labels[sel], "")
-        return ""
+        return getattr(self, "_ab_key", {}).get(sel, "")
 
     def _delete(self):
         if self.on_delete:
@@ -235,8 +250,11 @@ class SheetCard(ctk.CTkFrame):
             for k, v in self.metric_vars.items():
                 v.set(k in chosen_metrics)
             self.ab_var.set("ab" in chosen_metrics)
-            if spec.get("antibiotic"):
-                self._pending_ab = spec["antibiotic"]
+            ab_val = spec.get("antibiotic", "")
+            if ab_val:
+                # обратная совместимость: в старых пресетах «все антибиотики»
+                # могли храниться как текстовая метка, а не служебный ключ
+                self._pending_ab = AB_ALL_KEY if ab_val == AB_ALL_LABEL else ab_val
                 self._refresh_antibiotics()
             fkey = spec.get("filter", "none")
             for key, label in FILTER_OPTIONS:
