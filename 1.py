@@ -78,7 +78,7 @@ class App(ctk.CTk):
         inner.pack(fill="x", padx=16, pady=14)
         inner.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(inner, text="Исходный файл (Excel, лист TDSheet)",
+        ctk.CTkLabel(inner, text="Исходный файл (Excel с результатами посевов)",
                      font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0, columnspan=3,
                                                                     sticky="w", pady=(0, 6))
         self.input_entry = ctk.CTkEntry(inner, textvariable=self.input_file,
@@ -147,7 +147,7 @@ class App(ctk.CTk):
     def select_input(self):
         filename = filedialog.askopenfilename(
             title="Выберите файл с данными",
-            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")])
+            filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")])
         if filename:
             self.input_file.set(filename)
             if not self.output_file.get():
