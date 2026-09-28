@@ -691,14 +691,63 @@ def build_wound_sheet5(data, antibiotics, ab_indices, log_func=None):
 # ----------------------------------------------------------------------
 
 #: Доступные поля для группировки в конструкторе: (ключ, отображаемое имя)
+#: Любые поля можно комбинировать между собой — данные группируются по
+#: всем выбранным полям одновременно. Поле 'total' — режим «Всё вместе»:
+#: одна итоговая строка по всей выборке без разбивки.
 GROUP_FIELDS = [
+    ('total', 'Всё вместе (итог без разбивки)'),
     ('organism', 'Микроорганизм'),
     ('material_raw', 'Материал / локализация'),
+    ('material_organism', 'Материал + микроорганизм'),
     ('category', 'Категория материала'),
     ('year', 'Год'),
-    ('month', 'Месяц'),
+    ('year_quarter', 'Год + квартал'),
     ('quarter', 'Квартал'),
+    ('month', 'Месяц'),
+    ('year_month', 'Год + месяц'),
+    ('week', 'Неделя года'),
     ('weekday', 'День недели'),
+    ('patient_id', 'Пациент (история болезни)'),
+]
+
+#: Специальные ключи группировки
+TOTAL_GROUP_KEY = 'total'
+
+#: Готовые шаблоны (сценарии) для кнопки «Шаблон» в конструкторе:
+#: (имя шаблона, спецификация листа)
+SHEET_TEMPLATES = [
+    ('— выбрать шаблон —', None),
+    ('Резистентность по микроорганизмам', {
+        'name': 'Резистентность по микробам', 'groups': ['organism'],
+        'metrics': ['total', 'positive', 'ab'], 'filter': 'none'}),
+    ('Динамика по месяцам', {
+        'name': 'Динамика по месяцам', 'groups': ['year_month'],
+        'metrics': ['total', 'positive', 'pct_positive', 'diagnostic'],
+        'filter': 'none'}),
+    ('Динамика по кварталам', {
+        'name': 'Динамика по кварталам', 'groups': ['year_quarter'],
+        'metrics': ['total', 'positive', 'pct_positive'], 'filter': 'none'}),
+    ('Материал × микроорганизм', {
+        'name': 'Материал и микробы', 'groups': ['material_organism'],
+        'metrics': ['total', 'positive', 'pct_positive'], 'filter': 'none'}),
+    ('Эпидемиология: категории материалов', {
+        'name': 'Категории материалов', 'groups': ['category'],
+        'metrics': ['total', 'positive', 'pct_positive', 'patients'],
+        'filter': 'none'}),
+    ('Полный свод по году', {
+        'name': 'Свод по годам', 'groups': ['year'],
+        'metrics': ['total', 'positive', 'pct_positive', 'diagnostic',
+                    'pct_diagnostic', 'patients'], 'filter': 'none'}),
+    ('Год × микроорганизм (устойчивые)', {
+        'name': 'Год и микробы', 'groups': ['year', 'organism'],
+        'metrics': ['total', 'positive'], 'filter': 'positive_only'}),
+    ('Антибиотикограмма по материалу', {
+        'name': 'АБГ по материалу', 'groups': ['material_raw'],
+        'metrics': ['ab'], 'filter': 'none'}),
+    ('Итог по всем данным («всё вместе»)', {
+        'name': 'Итоговый свод', 'groups': ['total'],
+        'metrics': ['total', 'positive', 'pct_positive', 'diagnostic',
+                    'pct_diagnostic', 'patients'], 'filter': 'none'}),
 ]
 
 #: Доступные метрики: (ключ, отображаемое имя)
@@ -714,15 +763,20 @@ METRIC_OPTIONS = [
 #: Метрики антибиотикограммы (считаются отдельно, по выбранному антибиотику)
 AB_METRICS = ['S', 'I', 'R', 'НД']
 
-#: Фильтры: (ключ, отображаемое имя)
+#: Фильтры: (ключ, отображаемое имя). Специальные префиксы: 'organism=',
+#: 'category=' — фильтрация по конкретному значению.
 FILTER_OPTIONS = [
     ('none', 'Без фильтра'),
     ('positive_only', 'Только пробы с ростом'),
+    ('no_growth_only', 'Только «роста нет»'),
     ('diagnostic_only', 'Только диагностичные'),
+    ('non_diagnostic_only', 'Только недиагностичные'),
     ('wounds_only', 'Только раны'),
     ('urine_only', 'Только моча'),
     ('sputum_only', 'Только мокрота и т.д.'),
     ('blood_cat_only', 'Только кровь и катетеры'),
+    ('csf_only', 'Только ликвор'),
+    ('other_materials', 'Только прочие материалы'),
 ]
 
 _MONTH_NAMES = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
@@ -730,39 +784,65 @@ _MONTH_NAMES = ['Январь', 'Февраль', 'Март', 'Апрель', '�
 _WEEKDAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг',
                   'Пятница', 'Суббота', 'Воскресенье']
 
+#: Порядок сортировки колонок-метрик в итоговом листе
+METRIC_COLUMN_ORDER = ['Всего проб', 'Проб с ростом', '% положительных',
+                       'Диагностичных', '% диагностичных', 'Уникальных пациентов',
+                       'S', 'I', 'R', 'НД', 'Total', 'S%', 'I%', 'R%', 'НД%']
+
+
+def _has_date(d):
+    return pd.notna(d) and not pd.isna(d)
+
 
 def prepare_base_table(df_main, data=None):
     """Возвращает копию данных с доп. полями для конструктора:
-    category (категория материала), year/month/quarter/weekday (из даты)."""
+    category (категория материала), year/month/quarter/weekday/week (из даты),
+    составные ключи material_organism / year_month / year_quarter."""
     base = df_main.copy()
     base['category'] = base['material_raw'].apply(lambda x: categorize_material(str(x))[0])
     # подстраховка: если в df_main нет колонки 'organism', берём её из полных данных
     if 'organism' not in base.columns and data is not None and 'organism' in data.columns:
         base['organism'] = data['organism'].values[:len(base)]
+    if 'patient_id' not in base.columns and data is not None and 'patient_id' in data.columns:
+        base['patient_id'] = data['patient_id'].values[:len(base)]
 
     def _year(d):
-        return d.year if pd.notna(d) and not pd.isna(d) else None
+        return d.year if _has_date(d) else None
+
     base['year'] = base['date'].apply(_year)
     base['month'] = base['date'].apply(
-        lambda d: _MONTH_NAMES[d.month - 1] if pd.notna(d) and not pd.isna(d) else 'без даты')
+        lambda d: _MONTH_NAMES[d.month - 1] if _has_date(d) else 'без даты')
     base['quarter'] = base['date'].apply(
-        lambda d: f'Q{(d.month - 1) // 3 + 1} {d.year}' if pd.notna(d) and not pd.isna(d) else 'без даты')
+        lambda d: f'Q{(d.month - 1) // 3 + 1}' if _has_date(d) else 'без даты')
+    base['year_quarter'] = base['date'].apply(
+        lambda d: f'{d.year} Q{(d.month - 1) // 3 + 1}' if _has_date(d) else 'без даты')
+    base['year_month'] = base['date'].apply(
+        lambda d: f'{d.year}-{d.month:02d}' if _has_date(d) else 'без даты')
+    base['week'] = base['date'].apply(
+        lambda d: f'{d.year}-W{d.isocalendar()[1]:02d}' if _has_date(d) else 'без даты')
     base['weekday'] = base['date'].apply(
-        lambda d: _WEEKDAY_NAMES[d.weekday()] if pd.notna(d) and not pd.isna(d) else 'без даты')
+        lambda d: _WEEKDAY_NAMES[d.weekday()] if _has_date(d) else 'без даты')
+    # составной ключ «материал + микроорганизм»
+    base['material_organism'] = (base['material_raw'].astype(str).str.strip() + ' | ' +
+                                 base['organism'].fillna('роста нет').astype(str).str.strip())
     # сортировка месяцев по календарю
     base['_month_order'] = base['date'].apply(
-        lambda d: d.month if pd.notna(d) and not pd.isna(d) else 99)
+        lambda d: d.month if _has_date(d) else 99)
     return base
 
 
 def apply_spec_filter(base_df, spec):
     """Применяет фильтр спецификации листа к таблице посевов."""
-    ftype = spec.get('filter', 'none')
+    ftype = str(spec.get('filter', 'none'))
     df = base_df
     if ftype == 'positive_only':
         df = df[df['is_positive']]
+    elif ftype == 'no_growth_only':
+        df = df[~df['is_positive']]
     elif ftype == 'diagnostic_only':
         df = df[df['diagnostic']]
+    elif ftype == 'non_diagnostic_only':
+        df = df[~df['diagnostic']]
     elif ftype == 'wounds_only':
         df = df[df['category'] == 'РАНЫ']
     elif ftype == 'urine_only':
@@ -771,62 +851,137 @@ def apply_spec_filter(base_df, spec):
         df = df[df['category'] == 'мокрота и т.д.']
     elif ftype == 'blood_cat_only':
         df = df[df['category'].isin(['кровь', 'катетер'])]
+    elif ftype == 'csf_only':
+        df = df[df['category'] == 'жидкость цереброспинальная']
+    elif ftype == 'other_materials':
+        df = df[df['category'] == 'другие']
     elif ftype.startswith('organism='):
         org = ftype.split('=', 1)[1].strip().lower()
         df = df[df['organism'].astype(str).str.strip().str.lower() == org]
+    elif ftype.startswith('category='):
+        cat = ftype.split('=', 1)[1].strip().lower()
+        df = df[df['category'].astype(str).str.strip().str.lower() == cat]
     return df.copy()
 
 
+def resolve_group_fields(groups):
+    """Раскрывает составные ключи группировки в реальные колонки таблицы.
+    Возвращает (cols, labels): cols — список колонок base_df,
+    labels — {колонка: отображаемое имя}. Ключ 'total' раскрывается в []"""
+    labels = dict(GROUP_FIELDS)
+    COMPOSITE = {
+        'material_organism': (['material_raw', 'organism'],
+                              {'material_raw': 'Материал / локализация',
+                               'organism': 'Микроорганизм'}),
+        'year_month': (['year', 'month'], {'year': 'Год', 'month': 'Месяц'}),
+        'year_quarter': (['year', 'quarter'], {'year': 'Год', 'quarter': 'Квартал'}),
+    }
+    cols, col_labels = [], {}
+    for g in groups:
+        if g == TOTAL_GROUP_KEY:
+            continue
+        if g in COMPOSITE:
+            sub, sub_labels = COMPOSITE[g]
+            for c in sub:
+                if c not in cols:
+                    cols.append(c)
+                    col_labels[c] = sub_labels[c]
+        elif g in labels:
+            if g not in cols:
+                cols.append(g)
+                col_labels[g] = labels[g]
+    return cols, col_labels
+
+
+def _grouped_series(gb, func):
+    """Применяет func к каждой группе DataFrame и возвращает Series с индексом
+    групп. Обходит сбои pandas-а при агрегировании пустых/экзотических срезов."""
+    keys = []
+    vals = []
+    for name, g in gb:
+        keys.append(name)
+        vals.append(func(g))
+    if not keys:
+        return pd.Series(dtype="float64")
+    try:
+        idx = pd.Index(keys)
+    except Exception:
+        idx = pd.Index([str(k) for k in keys])
+    return pd.Series(vals, index=idx, dtype="float64")
+
+
 def compute_group_stats(df, group_cols):
-    """Сводная статистика по выбранным полям группировки (метрики посева)."""
-    gb = df.groupby(group_cols, dropna=False)
-    out = pd.DataFrame({
-        'Всего проб': gb.size(),
-        'Проб с ростом': gb['is_positive'].sum(),
-        'Диагностичных': gb.apply(
-            lambda g: int((g['is_positive'] & g['diagnostic']).sum()), include_groups=False),
-        'Пациентов': gb['patient_id'].nunique(),
-    })
+    """Сводная статистика по выбранным полям группировки (метрики посева).
+    Пустой group_cols означает режим «Всё вместе» — одна итоговая строка."""
     import numpy as np
-    total = out['Всего проб'].astype(float)
-    pos = out['Проб с ростом'].astype(float)
-    diag = out['Диагностичных'].astype(float)
-    out['% положительных'] = (pos / total.replace(0, np.nan) * 100).round(1).fillna(0)
-    out['% диагностичных'] = (diag / pos.replace(0, np.nan) * 100).round(1).fillna(0)
-    return out.reset_index()
+    if group_cols:
+        gb = df.groupby(group_cols, dropna=False)
+        out = pd.DataFrame({
+            'Всего проб': _grouped_series(gb, len),
+            'Проб с ростом': _grouped_series(gb, lambda g: int(g['is_positive'].sum())),
+            'Диагностичных': _grouped_series(
+                gb, lambda g: int((g['is_positive'] & g['diagnostic']).sum())),
+            'Уникальных пациентов': _grouped_series(
+                gb, lambda g: int(g['patient_id'].nunique())),
+        }).reset_index()
+    else:
+        total = len(df)
+        pos = int(df['is_positive'].sum()) if total else 0
+        diag = int((df['is_positive'] & df['diagnostic']).sum()) if total else 0
+        pats = int(df['patient_id'].nunique()) if total else 0
+        out = pd.DataFrame([{
+            'Всего проб': total, 'Проб с ростом': pos,
+            'Диагностичных': diag, 'Уникальных пациентов': pats}])
+    t = out['Всего проб'].astype(float)
+    p = out['Проб с ростом'].astype(float)
+    d = out['Диагностичных'].astype(float)
+    out['% положительных'] = (p / t.replace(0, np.nan) * 100).round(1).fillna(0)
+    out['% диагностичных'] = (d / p.replace(0, np.nan) * 100).round(1).fillna(0)
+    return out
 
 
 def compute_ab_group_stats(data, antibiotics, ab_indices, group_cols, antibiotic,
                            only_positive=True, base_df=None):
     """Статистика S/I/R/НД по выбранному антибиотику для заданных полей группировки.
 
-    Если среди group_cols есть производные поля (category, month, quarter, year,
-    weekday), они подтягиваются из base_df (таблица prepare_base_table).
+    group_cols — реальные колонки (после resolve_group_fields); пустой список
+    означает режим «Всё вместе» (одна итоговая строка). Производные поля
+    (category, year, month, quarter, week, weekday) подтягиваются из base_df.
+    Счёт идёт по всем образцам с ростом: пустое значение RSI считается как «НД».
     """
     if antibiotic not in antibiotics:
         raise ValueError(f"Антибиотик «{antibiotic}» не найден в исходном файле.")
+    import numpy as np
     i = antibiotics.index(antibiotic)
     col_idx = ab_indices[i]
     df = data[data['is_positive']].copy() if only_positive else data.copy()
     # добавляем производные поля из базовой таблицы (позиционно совпадают строки)
-    derived = [g for g in group_cols if g in ('category', 'year', 'month', 'quarter', 'weekday')]
+    derived = [g for g in group_cols
+               if g in ('category', 'year', 'month', 'quarter', 'year_month',
+                        'year_quarter', 'week', 'weekday', 'material_organism')]
     if derived and base_df is not None:
+        base_aligned = base_df.reset_index(drop=True)
+        src = df.reset_index(drop=True)
         for g in derived:
-            if g not in df.columns and g in base_df.columns:
-                df[g] = base_df[g].values[:len(df)] if len(base_df) >= len(df) else \
-                    pd.Series(base_df[g].values[:len(df)]).reindex(df.index).values
-    df['_rsi'] = df.iloc[:, col_idx].apply(
-        lambda v: str(v).strip().upper() if isinstance(v, str) else None)
-    # группировка только по непустым RSI ('' от «Роста нет» в столбце антибиотика — не категория)
-    df = df[df['_rsi'].isin(AB_METRICS)]
-    counts = (df.groupby(group_cols + ['_rsi'], dropna=False).size()
-              .unstack('_rsi', fill_value=0))
+            if g not in src.columns and g in base_aligned.columns:
+                df[g] = base_aligned[g].values[:len(df)]
+    def _rsi(v):
+        if isinstance(v, str):
+            s = v.strip().upper()
+            return s if s in AB_METRICS else 'НД'
+        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
+    df['_rsi'] = df.iloc[:, col_idx].apply(_rsi)
+    if group_cols:
+        counts = (df.groupby(group_cols + ['_rsi'], dropna=False).size()
+                  .unstack('_rsi', fill_value=0))
+    else:
+        vc = df['_rsi'].value_counts()
+        counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
     for m in AB_METRICS:
         if m not in counts.columns:
             counts[m] = 0
     counts = counts[AB_METRICS]
     counts['Total'] = counts.sum(axis=1)
-    import numpy as np
     total_f = counts['Total'].astype(float).replace(0, np.nan)
     for m in AB_METRICS:
         counts[f'{m}%'] = (counts[m].astype(float) / total_f * 100).round(1).fillna(0)
@@ -841,27 +996,47 @@ def sort_by_month(df, month_col='Месяц'):
     return tmp.sort_values('_mo').drop(columns='_mo').reset_index(drop=True)
 
 
+def _sort_key_for_group(col_label):
+    """Возвращает порядковый ключ для человекочитаемых значений группировки."""
+    if col_label == 'Месяц':
+        order = {name: k for k, name in enumerate(_MONTH_NAMES, start=1)}
+        return lambda v: (order.get(str(v), 99),)
+    if col_label == 'Квартал':
+        return lambda v: (str(v),)
+    if col_label == 'День недели':
+        order = {name: k for k, name in enumerate(_WEEKDAY_NAMES, start=1)}
+        return lambda v: (order.get(str(v), 99),)
+    return None
+
+
 def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func=None):
     """Строит один дополнительный лист по спецификации конструктора.
 
     Спецификация — словарь:
       name        — имя листа Excel
-      groups      — список полей группировки (ключи GROUP_FIELDS)
+      groups      — список полей группировки (ключи GROUP_FIELDS); любые
+                    комбинации поддерживаются, включая 'total' («всё вместе»)
       metrics     — список метрик; если содержит 'ab', считается антибиотикограмма
       antibiotic  — название антибиотика (когда metrics включает 'ab')
       filter      — ключ фильтра (FILTER_OPTIONS)
     Возвращает DataFrame или None, если лист построить не удалось.
     """
-    groups = [g for g in spec.get('groups', []) if g in dict(GROUP_FIELDS)]
+    valid_groups = dict(GROUP_FIELDS)
+    groups = [g for g in spec.get('groups', []) if g in valid_groups]
     if not groups:
+        # пустая группировка трактуется как режим «Всё вместе» (итог без разбивки)
         if log_func:
-            log_func(f"Лист «{spec.get('name')}»: не выбраны поля группировки — лист пропущен.")
-        return None
+            log_func(f"Лист «{spec.get('name')}»: поля группировки не выбраны — "
+                     f"будет построена одна итоговая строка («всё вместе»).")
+
+    # «Всё вместе» имеет приоритет: если выбран — игнорируем прочие поля
+    is_total = TOTAL_GROUP_KEY in groups or not groups
+    groups = [] if is_total else groups
+    group_cols, col_labels = resolve_group_fields(groups)
 
     filtered = apply_spec_filter(base_df, spec)
-    if filtered.empty:
-        if log_func:
-            log_func(f"Лист «{spec.get('name')}»: нет данных после применения фильтра.")
+    if filtered.empty and log_func:
+        log_func(f"Лист «{spec.get('name')}»: нет данных после применения фильтра.")
 
     _metric_keys = {k for k, _ in METRIC_OPTIONS}
     metrics = [m for m in spec.get('metrics', []) if m == 'ab' or m in _metric_keys]
@@ -874,15 +1049,20 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
     frames = []
 
     if any(m in _metric_keys for m in metrics):
-        stats = compute_group_stats(filtered, groups)
-        keep = list(groups) + [label for key, label in METRIC_OPTIONS if key in metrics]
+        stats = compute_group_stats(filtered, group_cols)
+        keep = group_cols + [label for key, label in METRIC_OPTIONS if key in metrics]
         frames.append(stats[[c for c in keep if c in stats.columns]])
 
     if 'ab' in metrics:
         ab_name = spec.get('antibiotic', '')
         try:
-            ab_stats = compute_ab_group_stats(data, antibiotics, ab_indices, groups,
+            ab_stats = compute_ab_group_stats(data, antibiotics, ab_indices, group_cols,
                                               ab_name, base_df=base_df)
+            # приводим колонки группировки к одному типу с посевной статистикой
+            # (иначе merge не найдёт ключей из-за различий dtype)
+            for c in group_cols:
+                if c in ab_stats.columns and c in filtered.columns:
+                    ab_stats[c] = ab_stats[c].astype(filtered[c].dtype)
             frames.append(ab_stats)
         except ValueError as e:
             if log_func:
@@ -895,35 +1075,93 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
 
     result = frames[0]
     for f in frames[1:]:
-        result = result.merge(f, on=groups, how='outer')
+        if group_cols:
+            result = result.merge(f, on=group_cols, how='outer')
+        else:
+            # режим «всё вместе»: склеиваем единственные строки без ключа
+            result = pd.concat([result.reset_index(drop=True),
+                                f.drop(columns=[c for c in f.columns
+                                                if c in result.columns],
+                                       errors='ignore').reset_index(drop=True)],
+                               axis=1)
+        # строки без антибиотикограммы (группы только в посевной статистике)
+        for c in ('S', 'I', 'R', 'НД', 'Total'):
+            if c in result.columns:
+                result[c] = result[c].fillna(0).astype(int)
+        for c in ('S%', 'I%', 'R%', 'НД%'):
+            if c in result.columns:
+                result[c] = result[c].fillna(0)
 
     # переименуем технические имена группировок в человекочитаемые
-    labels = dict(GROUP_FIELDS)
-    result = result.rename(columns={g: labels[g] for g in groups})
-    display_cols = [labels[g] for g in groups]
+    result = result.rename(columns=col_labels)
+    display_cols = [col_labels[c] for c in group_cols]
+    if is_total:
+        display_cols = ['Итог']
+        if result.columns.size and display_cols[0] not in result.columns:
+            result.insert(0, 'Итог', 'Все данные')
 
-    # упорядочиваем столбцы: сначала группы, затем остальное
+    # упорядочиваем столбцы: сначала группы, затем метрики в фиксированном порядке
     other = [c for c in result.columns if c not in display_cols]
-    result = result[display_cols + other]
+    ordered = [c for c in METRIC_COLUMN_ORDER if c in other]
+    rest = [c for c in other if c not in ordered]
+    result = result[display_cols + ordered + rest]
 
-    # сортировки
-    if 'month' in groups:
-        result = sort_by_month(result, labels['month'])
-    elif 'year' in groups and 'year' in result.columns:
-        result = result.sort_values(labels['year'])
-    elif 'quarter' in groups:
-        result = result.sort_values(labels['quarter'])
+    # ---- сортировка строк -------------------------------------------------
+    if is_total:
+        pass  # одна строка
     else:
-        num_cols = [c for c in other if c == 'Всего проб']
-        if num_cols:
-            result = result.sort_values(num_cols[0], ascending=False)
-        else:
-            result = result.sort_values(result.columns[-1], ascending=False)
-    result = result.reset_index(drop=True)
+        sort_specs = []          # [(колонка, ascending, ключ-функция)]
+        if 'year' in group_cols:
+            sort_specs.append(('Год', True, None))
+        if 'quarter' in group_cols:
+            sort_specs.append(('Квартал', True, _sort_key_for_group('Квартал')))
+        if 'month' in group_cols:
+            sort_specs.append(('Месяц', True, _sort_key_for_group('Месяц')))
+        if 'week' in group_cols:
+            sort_specs.append(('Неделя года', True, None))
+        if 'weekday' in group_cols:
+            sort_specs.append(('День недели', True, _sort_key_for_group('День недели')))
+        remaining = [col_labels[c] for c in group_cols
+                     if col_labels[c] not in {s[0] for s in sort_specs}]
+        if sort_specs:
+            # сначала временна́я шкала, затем прочие выбранные группы,
+            # внутри группы — по убыванию объёма проб
+            extra = [('Всего проб', False, None)] if 'Всего проб' in result.columns else []
+            keys = sort_specs + [(c, True, None) for c in remaining] + extra
+            tmp = result.copy()
+            by, asc = [], []
+            for col, a, kf in keys:
+                if col not in tmp.columns:
+                    continue
+                if kf:
+                    tmp['_k_' + col] = tmp[col].map(lambda v: kf(v)[0])
+                    by.append('_k_' + col)
+                else:
+                    by.append(col)
+                asc.append(a)
+            if by:
+                result = tmp.sort_values(by, ascending=asc).drop(
+                    columns=[c for c in tmp.columns if str(c).startswith('_k_')])
+        elif 'material_raw' in group_cols or 'category' in group_cols:
+            # эпидемиологические срезы: категории/материалы по убыванию числа проб
+            if 'Всего проб' in result.columns:
+                primary = 'Материал / локализация' if 'material_raw' in group_cols else 'Категория материала'
+                result = result.sort_values([primary, 'Всего проб'],
+                                            ascending=[True, False])
+            if 'category' in group_cols:
+                pass
+        elif remaining:
+            first = col_labels[group_cols[0]]
+            if 'Всего проб' in result.columns and first in result.columns:
+                result = result.sort_values([first, 'Всего проб'], ascending=[True, False])
+            elif 'Всего проб' in result.columns:
+                result = result.sort_values('Всего проб', ascending=False)
+        result = result.reset_index(drop=True)
 
     if log_func:
-        log_func(f"Лист «{spec.get('name')}»: {len(result)} строк "
-                 f"(группировка: {', '.join(labels[g] for g in groups)}).")
+        desc = 'всё вместе (итог)' if is_total else \
+               ', '.join(col_labels[c] for c in group_cols)
+        log_func(f"Лист «{spec.get('name')}»: {len(result)} строк (группировка: {desc}).")
     return result
 
 
@@ -939,14 +1177,17 @@ def validate_spec(spec, available_antibiotics=None):
     """Проверяет спецификацию листа; возвращает список сообщений об ошибках.
 
     Название автокорректируется (санитизируется), отсутствие метрик не является
-    ошибкой — применится набор по умолчанию.
+    ошибкой — применится набор по умолчанию. Пустая группировка допустима и
+    трактуется как режим «Всё вместе» (итог без разбивки).
     """
     errors = []
     name = sanitize_sheet_name(str(spec.get('name', '')).strip())
     if len(name) > 31:
         errors.append("Название листа не должно превышать 31 символ.")
-    if not spec.get('groups'):
-        errors.append("Выберите хотя бы одно поле группировки.")
+    groups = [g for g in spec.get('groups', []) if g in dict(GROUP_FIELDS)]
+    if not groups:
+        # не ошибка: будет построен итог «всё вместе»
+        pass
     metrics = [m for m in spec.get('metrics', [])
                if m == 'ab' or m in {k for k, _ in METRIC_OPTIONS}]
     if 'ab' in metrics:

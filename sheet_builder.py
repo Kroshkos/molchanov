@@ -23,7 +23,7 @@ import customtkinter as ctk
 
 from app_core import (
     GROUP_FIELDS, METRIC_OPTIONS, FILTER_OPTIONS, validate_spec,
-    save_sheet_specs, load_sheet_specs,
+    save_sheet_specs, load_sheet_specs, SHEET_TEMPLATES, TOTAL_GROUP_KEY,
 )
 
 ACCENT = "#2CC98F"
@@ -37,6 +37,7 @@ class SheetCard(ctk.CTkFrame):
         self.index = index
         self.on_delete = on_delete
         self._antibiotics_getter = antibiotics_getter or (lambda: [])
+        self._suppress_cb_logic = False  # защита от рекурсии при программной установке
 
         spec = spec or {}
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -58,8 +59,9 @@ class SheetCard(ctk.CTkFrame):
         ctk.CTkEntry(body, textvariable=self.name_var, width=220).grid(
             row=0, column=1, columnspan=3, sticky="ew", pady=4)
 
-        # Группировка (несколько чекбоксов)
-        ctk.CTkLabel(body, text="Группировать по:", font=ctk.CTkFont(size=12)).grid(
+        # Группировка (несколько чекбоксов; «Всё вместе» — эксклюзивный режим)
+        ctk.CTkLabel(body, text="Группировать по:\n(можно выбирать несколько)",
+                     font=ctk.CTkFont(size=12), justify="left").grid(
             row=1, column=0, sticky="nw", pady=(8, 4), padx=(0, 8))
         grp_frame = ctk.CTkFrame(body, fg_color="transparent")
         grp_frame.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 2))
@@ -69,10 +71,16 @@ class SheetCard(ctk.CTkFrame):
             chosen_groups = {"organism"}
         for i, (key, label) in enumerate(GROUP_FIELDS):
             var = ctk.BooleanVar(value=key in chosen_groups)
-            ctk.CTkCheckBox(grp_frame, text=label, variable=var,
-                            font=ctk.CTkFont(size=12)).grid(
-                row=i // 2, column=i % 2, sticky="w", padx=(0, 16), pady=2)
+            cb = ctk.CTkCheckBox(grp_frame, text=label, variable=var,
+                                 font=ctk.CTkFont(size=12))
+            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 16), pady=2)
             self.group_vars[key] = var
+            var.trace_add("write", lambda *_: self._on_group_toggled())
+        self.group_hint = ctk.CTkLabel(grp_frame, text="", font=ctk.CTkFont(size=11),
+                                       text_color=("gray45", "gray65"))
+        self.group_hint.grid(row=(len(GROUP_FIELDS) + 1) // 2, column=0,
+                             columnspan=2, sticky="w", pady=(2, 0))
+        self._update_group_hint()
 
         # Метрики
         ctk.CTkLabel(body, text="Метрики:", font=ctk.CTkFont(size=12)).grid(
@@ -121,6 +129,44 @@ class SheetCard(ctk.CTkFrame):
         self.ab_var.trace_add("write", lambda *_: self._refresh_antibiotics())
 
     # ------------------------------------------------------------------
+    def _on_group_toggled(self):
+        """Эксклюзивность «Всё вместе»: при его выборе снимаем прочие поля,
+        при выборе прочего — снимаем «Всё вместе»."""
+        if getattr(self, "_suppress_cb_logic", False):
+            return
+        total_var = self.group_vars.get(TOTAL_GROUP_KEY)
+        if total_var is None:
+            self._update_group_hint()
+            return
+        others_on = [k for k, v in self.group_vars.items()
+                     if k != TOTAL_GROUP_KEY and v.get()]
+        if total_var.get():
+            if others_on:
+                self._suppress_cb_logic = True
+                try:
+                    for k in others_on:
+                        self.group_vars[k].set(False)
+                finally:
+                    self._suppress_cb_logic = False
+        elif others_on:
+            pass  # обычная комбинированная группировка
+        self._update_group_hint()
+
+    def _update_group_hint(self):
+        """Показывает итоговую схему группировки прямо под чекбоксами."""
+        labels = dict(GROUP_FIELDS)
+        chosen = [k for k, v in self.group_vars.items() if v.get()]
+        if not chosen:
+            text = "ℹ️ Группировка не выбрана — лист будет построен как «всё вместе» (итог)."
+        elif TOTAL_GROUP_KEY in chosen:
+            text = "📊 Режим «всё вместе»: одна итоговая строка по всей выборке."
+        else:
+            text = "➡️ Схема: " + " × ".join(labels[k] for k in chosen)
+        try:
+            self.group_hint.configure(text=text)
+        except Exception:
+            pass
+
     def _refresh_antibiotics(self):
         """Заполняет список антибиотиков из исходного файла."""
         try:
@@ -139,6 +185,30 @@ class SheetCard(ctk.CTkFrame):
     def _delete(self):
         if self.on_delete:
             self.on_delete(self)
+
+    def apply_spec(self, spec):
+        """Программно применяет спецификацию к карточке (для шаблонов)."""
+        self._suppress_cb_logic = True
+        try:
+            self.name_var.set(spec.get("name", self.name_var.get()))
+            chosen_groups = set(spec.get("groups", []))
+            for k, v in self.group_vars.items():
+                v.set(k in chosen_groups)
+            chosen_metrics = set(spec.get("metrics", []))
+            for k, v in self.metric_vars.items():
+                v.set(k in chosen_metrics)
+            self.ab_var.set("ab" in chosen_metrics)
+            if spec.get("antibiotic"):
+                self._pending_ab = spec["antibiotic"]
+                self._refresh_antibiotics()
+            fkey = spec.get("filter", "none")
+            for key, label in FILTER_OPTIONS:
+                if key == fkey:
+                    self.filter_menu.set(label)
+                    break
+        finally:
+            self._suppress_cb_logic = False
+        self._update_group_hint()
 
     def get_spec(self):
         groups = [k for k, v in self.group_vars.items() if v.get()]
@@ -187,12 +257,19 @@ class SheetBuilderDialog(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=12),
                      text_color=("gray40", "gray65")).pack(anchor="w")
 
-        # Пресеты
+        # Пресеты и шаблоны
         preset_bar = ctk.CTkFrame(self, fg_color="transparent")
         preset_bar.pack(fill="x", padx=18, pady=(8, 0))
         ctk.CTkButton(preset_bar, text="＋ Добавить лист", width=140, height=30,
                       fg_color=ACCENT, hover_color="#25a878",
                       command=lambda: self._add_card()).pack(side="left", padx=(0, 8))
+        # Быстрый шаблон — применяет типовую сценарную настройку к последней карточке
+        ctk.CTkLabel(preset_bar, text="Шаблон →", font=ctk.CTkFont(size=12),
+                     text_color=("gray40", "gray65")).pack(side="left", padx=(0, 4))
+        self.template_menu = ctk.CTkOptionMenu(
+            preset_bar, values=[name for name, _ in SHEET_TEMPLATES], width=250,
+            command=self._apply_template)
+        self.template_menu.pack(side="left", padx=(0, 8))
         ctk.CTkButton(preset_bar, text="💾 Сохранить пресет…", width=150, height=30,
                       fg_color="transparent", border_width=1,
                       command=self._save_preset).pack(side="left", padx=4)
@@ -269,6 +346,26 @@ class SheetBuilderDialog(ctk.CTkToplevel):
             pass
         # переиндексация оставшихся карточек не требуется — имена по умолчанию
         # фиксируются при создании
+
+    def _apply_template(self, template_name):
+        """Применяет выбранный шаблон к последней карточке (или создаёт новую)."""
+        spec = None
+        for name, s in SHEET_TEMPLATES:
+            if name == template_name and s is not None:
+                spec = dict(s)  # копия, чтобы не мутировать исходный шаблон
+                break
+        if spec is None:
+            self.template_menu.set(SHEET_TEMPLATES[0][0])
+            return
+        try:
+            if not self._cards:
+                self._add_card()
+            card = self._cards[-1]
+            card.apply_spec(spec)
+            self.template_menu.set(SHEET_TEMPLATES[0][0])
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось применить шаблон: {e}",
+                                 parent=self)
 
     def _apply(self):
         specs = [c.get_spec() for c in self._cards]
