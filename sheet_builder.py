@@ -24,6 +24,7 @@ import customtkinter as ctk
 from app_core import (
     GROUP_FIELDS, METRIC_OPTIONS, FILTER_OPTIONS, validate_spec,
     save_sheet_specs, load_sheet_specs, SHEET_TEMPLATES, TOTAL_GROUP_KEY,
+    AB_ALL_KEY, AB_ALL_LABEL,
 )
 
 ACCENT = "#2CC98F"
@@ -103,20 +104,26 @@ class SheetCard(ctk.CTkFrame):
                         variable=self.ab_var, font=ctk.CTkFont(size=12)).grid(
             row=ab_row, column=0, columnspan=2, sticky="w", pady=2)
 
-        # Антибиотик + фильтр
+        # Антибиотик + фильтр (одна строка, элементы растягиваются по ширине)
         row3 = ctk.CTkFrame(body, fg_color="transparent")
-        row3.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ctk.CTkLabel(row3, text="Антибиотик:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
-        self.antibiotic_menu = ctk.CTkOptionMenu(row3, values=["—"], width=180)
-        self.antibiotic_menu.pack(side="left", padx=(0, 18))
-        ctk.CTkLabel(row3, text="Фильтр:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 6))
+        row3.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        row3.columnconfigure(1, weight=1)
+        row3.columnconfigure(3, weight=1)
+        ctk.CTkLabel(row3, text="Антибиотик:", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=0, sticky="w", padx=(0, 6))
+        self.antibiotic_menu = ctk.CTkOptionMenu(row3, values=["—"])
+        self.antibiotic_menu.grid(row=0, column=1, sticky="ew", padx=(0, 18))
+        ctk.CTkLabel(row3, text="Фильтр:", font=ctk.CTkFont(size=12)).grid(
+            row=0, column=2, sticky="w", padx=(0, 6))
         self.filter_menu = ctk.CTkOptionMenu(
-            row3, values=[label for _, label in FILTER_OPTIONS], width=200)
-        self.filter_menu.pack(side="left")
+            row3, values=[label for _, label in FILTER_OPTIONS])
+        self.filter_menu.grid(row=0, column=3, sticky="ew")
 
         # восстановление выбранных антибиотика/фильтра
         if spec.get("antibiotic"):
-            self._pending_ab = spec["antibiotic"]
+            ab_val = spec["antibiotic"]
+            # обратная совместимость: в старых пресетах имя могло храниться прямо
+            self._pending_ab = AB_ALL_KEY if ab_val == AB_ALL_LABEL else ab_val
         if spec.get("filter"):
             fkey = spec["filter"]
             for key, label in FILTER_OPTIONS:
@@ -168,19 +175,49 @@ class SheetCard(ctk.CTkFrame):
             pass
 
     def _refresh_antibiotics(self):
-        """Заполняет список антибиотиков из исходного файла."""
+        """Заполняет список антибиотиков из исходного файла.
+        Первым пунктом всегда идёт «Все антибиотики» (суммарная АБГ)."""
         try:
             abs_list = list(self._antibiotics_getter())
         except Exception:
             abs_list = []
-        values = abs_list if abs_list else ["нет данных — выберите исходный файл"]
-        self.antibiotic_menu.configure(values=values)
-        pending = getattr(self, "_pending_ab", None)
-        if pending and pending in values:
-            self.antibiotic_menu.set(pending)
+        # значения с суффиксом-меткой, чтобы исключить коллизию реального
+        # антибиотика со служебным ключом AB_ALL_KEY
+        self._ab_disp = {}          # отображаемое имя -> значение в меню
+        self._ab_key = {}           # значение в меню -> настоящий ключ
+        all_disp = f"⭐ {AB_ALL_LABEL}"
+        all_val = f"{AB_ALL_KEY}\t{all_disp}"
+        self._ab_disp[all_disp] = all_val
+        self._ab_key[all_val] = AB_ALL_KEY
+        values = [all_val]
+        for a in abs_list:
+            if a not in self._ab_disp:
+                val = f"{a}\t{a}"
+                self._ab_disp[a] = val
+                self._ab_key[val] = a
+                values.append(val)
+        self.antibiotic_menu.configure(values=[self._ab_disp[k] for k in
+                                               ([AB_ALL_LABEL] + abs_list)])
+        # восстановление выбранного значения
+        want_key = getattr(self, "_pending_ab", None) or \
+            self._ab_key.get(self.antibiotic_menu.get(), "")
+        if want_key and want_key in self._ab_key.values():
+            disp = all_disp if want_key == AB_ALL_KEY else want_key
+            self.antibiotic_menu.set(disp)
             self._pending_ab = None
         elif abs_list:
             self.antibiotic_menu.set(abs_list[0])
+        else:
+            self.antibiotic_menu.set(all_disp)
+
+    def _selected_antibiotic(self):
+        """Возвращает ключ выбранного антибиотика (AB_ALL_KEY для «всех»,
+        '' — если выбор некорректен)."""
+        sel = self.antibiotic_menu.get()
+        labels = getattr(self, "_ab_disp", {})
+        if sel in labels:
+            return self._ab_key.get(labels[sel], "")
+        return ""
 
     def _delete(self):
         if self.on_delete:
@@ -225,7 +262,7 @@ class SheetCard(ctk.CTkFrame):
             "name": self.name_var.get().strip(),
             "groups": groups,
             "metrics": metrics,
-            "antibiotic": self.antibiotic_menu.get() if self.ab_var.get() else "",
+            "antibiotic": self._selected_antibiotic() if self.ab_var.get() else "",
             "filter": filter_key,
         }
 
@@ -236,8 +273,8 @@ class SheetBuilderDialog(ctk.CTkToplevel):
     def __init__(self, master, antibiotics_getter=None):
         super().__init__(master)
         self.title("🧩 Конструктор листов отчёта")
-        self.geometry("880x640")
-        self.minsize(720, 520)
+        self.geometry("1100x680")
+        self.minsize(940, 540)
         self.transient(master)
         self.grab_set()
 
@@ -257,28 +294,32 @@ class SheetBuilderDialog(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=12),
                      text_color=("gray40", "gray65")).pack(anchor="w")
 
-        # Пресеты и шаблоны
+        # Пресеты и шаблоны (две строки, чтобы всё помещалось без обрезания)
         preset_bar = ctk.CTkFrame(self, fg_color="transparent")
         preset_bar.pack(fill="x", padx=18, pady=(8, 0))
-        ctk.CTkButton(preset_bar, text="＋ Добавить лист", width=140, height=30,
+        row_a = ctk.CTkFrame(preset_bar, fg_color="transparent")
+        row_a.pack(fill="x")
+        row_b = ctk.CTkFrame(preset_bar, fg_color="transparent")
+        row_b.pack(fill="x", pady=(6, 0))
+        ctk.CTkButton(row_a, text="＋ Добавить лист", width=140, height=30,
                       fg_color=ACCENT, hover_color="#25a878",
                       command=lambda: self._add_card()).pack(side="left", padx=(0, 8))
         # Быстрый шаблон — применяет типовую сценарную настройку к последней карточке
-        ctk.CTkLabel(preset_bar, text="Шаблон →", font=ctk.CTkFont(size=12),
+        ctk.CTkLabel(row_a, text="Шаблон →", font=ctk.CTkFont(size=12),
                      text_color=("gray40", "gray65")).pack(side="left", padx=(0, 4))
         self.template_menu = ctk.CTkOptionMenu(
-            preset_bar, values=[name for name, _ in SHEET_TEMPLATES], width=250,
+            row_a, values=[name for name, _ in SHEET_TEMPLATES], width=320,
             command=self._apply_template)
         self.template_menu.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(preset_bar, text="💾 Сохранить пресет…", width=150, height=30,
+        ctk.CTkButton(row_b, text="💾 Сохранить пресет…", width=160, height=30,
                       fg_color="transparent", border_width=1,
-                      command=self._save_preset).pack(side="left", padx=4)
-        ctk.CTkButton(preset_bar, text="📂 Загрузить пресет…", width=150, height=30,
+                      command=self._save_preset).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(row_b, text="📂 Загрузить пресет…", width=160, height=30,
                       fg_color="transparent", border_width=1,
-                      command=self._load_preset).pack(side="left", padx=4)
-        ctk.CTkButton(preset_bar, text="🔄 Антибиотики", width=130, height=30,
+                      command=self._load_preset).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(row_b, text="🔄 Обновить список антибиотиков", width=240, height=30,
                       fg_color="transparent", border_width=1,
-                      command=self._refresh_all_antibiotics).pack(side="left", padx=4)
+                      command=self._refresh_all_antibiotics).pack(side="left")
 
         # Скроллируемая область карточек
         self.scroll = ctk.CTkScrollableFrame(self)

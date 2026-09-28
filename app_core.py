@@ -713,6 +713,11 @@ GROUP_FIELDS = [
 #: Специальные ключи группировки
 TOTAL_GROUP_KEY = 'total'
 
+#: Специальное значение в выборе антибиотика: «Все антибиотики» — суммарная
+#: антибиотикограмма по всем АБ-колонкам исходного файла сразу.
+AB_ALL_KEY = '__ALL__'
+AB_ALL_LABEL = 'Все антибиотики'
+
 #: Готовые шаблоны (сценарии) для кнопки «Шаблон» в конструкторе:
 #: (имя шаблона, спецификация листа)
 SHEET_TEMPLATES = [
@@ -744,6 +749,10 @@ SHEET_TEMPLATES = [
     ('Антибиотикограмма по материалу', {
         'name': 'АБГ по материалу', 'groups': ['material_raw'],
         'metrics': ['ab'], 'filter': 'none'}),
+    ('Суммарная АБГ (все антибиотики) по микробам', {
+        'name': 'АБГ все АБ по микробам', 'groups': ['organism'],
+        'metrics': ['total', 'positive', 'ab'], 'antibiotic': AB_ALL_KEY,
+        'filter': 'none'}),
     ('Итог по всем данным («всё вместе»)', {
         'name': 'Итоговый свод', 'groups': ['total'],
         'metrics': ['total', 'positive', 'pct_positive', 'diagnostic',
@@ -910,20 +919,35 @@ def _grouped_series(gb, func):
     return pd.Series(vals, index=idx, dtype="float64")
 
 
+def _group_keys_frame(gb, group_cols):
+    """Кадр с ключами групп (по одной колонке на поле группировки).
+    Устойчив к случаям, когда pandas не выносит колонки групп из индекса."""
+    keys = list(gb.groups.keys())
+    if not group_cols:
+        return pd.DataFrame({c: [] for c in group_cols})
+    if len(group_cols) == 1:
+        vals = [k[0] if isinstance(k, tuple) else k for k in keys]
+        return pd.DataFrame({group_cols[0]: vals})
+    return pd.DataFrame(keys, columns=group_cols)
+
+
 def compute_group_stats(df, group_cols):
     """Сводная статистика по выбранным полям группировки (метрики посева).
     Пустой group_cols означает режим «Всё вместе» — одна итоговая строка."""
     import numpy as np
     if group_cols:
         gb = df.groupby(group_cols, dropna=False)
-        out = pd.DataFrame({
-            'Всего проб': _grouped_series(gb, len),
-            'Проб с ростом': _grouped_series(gb, lambda g: int(g['is_positive'].sum())),
-            'Диагностичных': _grouped_series(
-                gb, lambda g: int((g['is_positive'] & g['diagnostic']).sum())),
-            'Уникальных пациентов': _grouped_series(
-                gb, lambda g: int(g['patient_id'].nunique())),
-        }).reset_index()
+        out = pd.concat(
+            [_group_keys_frame(gb, group_cols).reset_index(drop=True),
+             pd.DataFrame({
+                 'Всего проб': _grouped_series(gb, len),
+                 'Проб с ростом': _grouped_series(gb, lambda g: int(g['is_positive'].sum())),
+                 'Диагностичных': _grouped_series(
+                     gb, lambda g: int((g['is_positive'] & g['diagnostic']).sum())),
+                 'Уникальных пациентов': _grouped_series(
+                     gb, lambda g: int(g['patient_id'].nunique())),
+             }).reset_index(drop=True)],
+            axis=1)
     else:
         total = len(df)
         pos = int(df['is_positive'].sum()) if total else 0
@@ -948,12 +972,19 @@ def compute_ab_group_stats(data, antibiotics, ab_indices, group_cols, antibiotic
     означает режим «Всё вместе» (одна итоговая строка). Производные поля
     (category, year, month, quarter, week, weekday) подтягиваются из base_df.
     Счёт идёт по всем образцам с ростом: пустое значение RSI считается как «НД».
+
+    Особый случай: antibiotic == AB_ALL_KEY («Все антибиотики») — считается
+    суммарная антибиотикограмма по всем АБ-колонкам сразу (каждая ячейка
+    «проба × антибиотик» даёт один зачёт; непустые MIC-значения не учитываются).
     """
-    if antibiotic not in antibiotics:
-        raise ValueError(f"Антибиотик «{antibiotic}» не найден в исходном файле.")
     import numpy as np
-    i = antibiotics.index(antibiotic)
-    col_idx = ab_indices[i]
+
+    def _rsi(v):
+        if isinstance(v, str):
+            s = v.strip().upper()
+            return s if s in AB_METRICS else 'НД'
+        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
+
     df = data[data['is_positive']].copy() if only_positive else data.copy()
     # добавляем производные поля из базовой таблицы (позиционно совпадают строки)
     derived = [g for g in group_cols
@@ -965,23 +996,52 @@ def compute_ab_group_stats(data, antibiotics, ab_indices, group_cols, antibiotic
         for g in derived:
             if g not in src.columns and g in base_aligned.columns:
                 df[g] = base_aligned[g].values[:len(df)]
-    def _rsi(v):
-        if isinstance(v, str):
-            s = v.strip().upper()
-            return s if s in AB_METRICS else 'НД'
-        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
-    df['_rsi'] = df.iloc[:, col_idx].apply(_rsi)
-    if group_cols:
-        counts = (df.groupby(group_cols + ['_rsi'], dropna=False).size()
-                  .unstack('_rsi', fill_value=0))
+
+    if antibiotic == AB_ALL_KEY:
+        # суммарная АБГ: «разворачиваем» все АБ-колонки в длинные данные
+        if not antibiotics or not ab_indices:
+            raise ValueError("В исходном файле не найдено колонок антибиотиков.")
+        ab_cols = list(ab_indices)[:len(antibiotics)]
+        long_parts = []
+        for k, (ab_name, col_idx) in enumerate(zip(antibiotics, ab_cols)):
+            part = df[group_cols].copy() if group_cols else pd.DataFrame(index=df.index)
+            part['_rsi'] = df.iloc[:, col_idx].apply(_rsi)
+            long_parts.append(part)
+        long_df = pd.concat(long_parts, ignore_index=True)
+        if group_cols:
+            counts = (long_df.groupby(group_cols + ['_rsi'], dropna=False).size()
+                      .unstack('_rsi', fill_value=0))
+            # unstack может поместить колонки группировки в MultiIndex — снимаем
+            if isinstance(counts.index, pd.MultiIndex):
+                counts = counts.reset_index()
+        else:
+            vc = long_df['_rsi'].value_counts()
+            counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
     else:
-        vc = df['_rsi'].value_counts()
-        counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
+        if antibiotic not in antibiotics:
+            raise ValueError(f"Антибиотик «{antibiotic}» не найден в исходном файле.")
+        i = antibiotics.index(antibiotic)
+        col_idx = ab_indices[i]
+        df['_rsi'] = df.iloc[:, col_idx].apply(_rsi)
+        if group_cols:
+            counts = (df.groupby(group_cols + ['_rsi'], dropna=False).size()
+                      .unstack('_rsi', fill_value=0))
+        else:
+            vc = df['_rsi'].value_counts()
+            counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
     for m in AB_METRICS:
         if m not in counts.columns:
             counts[m] = 0
     counts = counts[AB_METRICS]
-    counts['Total'] = counts.sum(axis=1)
+    # после unstack колонки группировки могут остаться в индексе (в т.ч. с
+    # именем '_rsi') — гарантированно выносим их в обычные столбцы
+    if any(c in counts.index.names for c in group_cols) or \
+            counts.index.name is not None:
+        counts = counts.reset_index()
+    if isinstance(counts.columns, pd.MultiIndex):
+        counts.columns = [str(c) for c in counts.columns]
+    counts = counts.drop(columns=['_rsi'], errors='ignore')
+    counts['Total'] = counts[AB_METRICS].sum(axis=1)
     total_f = counts['Total'].astype(float).replace(0, np.nan)
     for m in AB_METRICS:
         counts[f'{m}%'] = (counts[m].astype(float) / total_f * 100).round(1).fillna(0)
@@ -1058,16 +1118,27 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
         try:
             ab_stats = compute_ab_group_stats(data, antibiotics, ab_indices, group_cols,
                                               ab_name, base_df=base_df)
-            # приводим колонки группировки к одному типу с посевной статистикой
-            # (иначе merge не найдёт ключей из-за различий dtype)
-            for c in group_cols:
-                if c in ab_stats.columns and c in filtered.columns:
-                    ab_stats[c] = ab_stats[c].astype(filtered[c].dtype)
-            frames.append(ab_stats)
+            # нормализуем структуру АБГ-таблицы для слияния: оставляем только
+            # колонки группировки и метрики S/I/R/НД (служебные index/_rsi — в мусор)
+            ab_keep = [c for c in group_cols if c in ab_stats.columns]
+            ab_mcols = [c for c in AB_METRICS + ['Total'] + [f'{m}%' for m in AB_METRICS]
+                        if c in ab_stats.columns]
+            missing = [c for c in group_cols if c not in ab_stats.columns]
+            ab_stats = ab_stats[ab_keep + ab_mcols].copy()
+            if missing and log_func:
+                log_func(f"Лист «{spec.get('name')}»: в антибиотикограмме не найдены "
+                         f"поля группировки {missing} — лист построен без АБГ.")
+                ab_stats = None
+            if ab_stats is not None:
+                # приводим колонки группировки к одному типу с посевной статистикой
+                # (иначе merge не найдёт ключей из-за различий dtype)
+                for c in group_cols:
+                    if c in filtered.columns:
+                        ab_stats[c] = ab_stats[c].astype(filtered[c].dtype)
+                frames.append(ab_stats)
         except ValueError as e:
             if log_func:
                 log_func(f"Лист «{spec.get('name')}»: {e}")
-
     if not frames:
         if log_func:
             log_func(f"Лист «{spec.get('name')}»: не выбрано ни одной метрики — лист пропущен.")
@@ -1194,7 +1265,8 @@ def validate_spec(spec, available_antibiotics=None):
         ab = spec.get('antibiotic', '')
         if not ab:
             errors.append("Для метрики «антибиотикограмма» выберите антибиотик.")
-        elif available_antibiotics is not None and ab not in available_antibiotics:
+        elif ab != AB_ALL_KEY and available_antibiotics is not None \
+                and ab not in available_antibiotics:
             errors.append(f"Антибиотик «{ab}» отсутствует в текущем исходном файле.")
     return errors
 
