@@ -18,67 +18,237 @@ from openpyxl.utils import get_column_letter
 # 1. Загрузка и предобработка данных (расширенная)
 # ----------------------------------------------------------------------
 
+# Ключевые слова, по которым распознаём служебные столбцы (без жёстких названий)
+_HEADER_KEYWORDS = ('заказ', 'история болезни', 'дата', 'материал', 'фио',
+                    'patient', 'date', 'material', 'fio')
+
+# Варианты названий ключевых столбцов (синонимы, регистронезависимо)
+_ORGANISM_KEYS = ('микро', 'organism', 'возбудитель', 'идентификац', 'microbiolog',
+                  'species', 'специес')
+_DATE_KEYS = ('дат', 'date', 'число', 'дата посева', 'поступил')
+_MATERIAL_KEYS = ('матер', 'биоматеріал', 'локализ', 'object', 'bid', 'вид материала',
+                  'материал')
+_PATIENT_KEYS = ('история', 'patient', 'номер', 'карта', 'закз', 'id', '№', 'п/п', 'фио', 'fio')
+
+
+def _matches(col_norm, keys):
+    return any(k in col_norm for k in keys)
+
+
+def _norm(s):
+    """Нормализация строки для нечувствительного сравнения."""
+    return str(s).strip().lower().replace('\xa0', ' ')
+
+
+def pick_sheet(xl, log_func=None):
+    """Выбирает лист: сначала «TDSheet», затем первый лист с распознанными данными."""
+    names = xl.sheet_names
+    candidates = []
+    for name in names:
+        if _norm(name) == 'tdsheet':
+            candidates.insert(0, name)
+        else:
+            candidates.append(name)
+
+    for name in candidates:
+        df_try = xl.parse(sheet_name=name, header=None)
+        hdr = find_header_row(df_try)
+        if hdr is not None:
+            if log_func and name != candidates[0]:
+                log_func(f"Лист '{name}': используется как источник данных "
+                         f"(строка заголовков — {hdr + 1}).")
+            return df_try, hdr
+        if log_func:
+            log_func(f"Лист '{name}' просмотрен — знакомых заголовков не найдено, пробуем следующий…")
+    raise ValueError(
+        "Не удалось распознать данные ни на одном листе. "
+        "Убедитесь, что в файле есть таблица с колонками вроде «Дата», «Материал», «Микроорганизм»."
+    )
+
+
+def find_header_row(df_raw):
+    """Ищет строку-заголовок без жёстких требований к оформлению.
+
+    Подходит строка, первая ячейка которой содержит «Заказ»/«№»/«ID», либо
+    строка с двумя и более известными заголовками («дата», «материал», «ФИО»…).
+    Дополнительно строка признаётся заголовком, если в ней есть столбец про
+    микроорганизм и ещё один распознанный столбец — это позволяет открывать
+    файлы с нестандартными названиями колонок.
+    """
+    best_idx, best_score = None, 0
+    limit = min(len(df_raw), 60)
+    for i in range(limit):
+        vals = [_norm(v) for v in df_raw.iloc[i].tolist() if pd.notna(v)]
+        if len(vals) < 2:
+            continue
+        first = vals[0]
+        score = 0
+        if first.startswith('заказ') or first in ('№', 'no', 'no.', 'id'):
+            score += 2
+        matched = set()
+        has_organism = False
+        other_hits = 0
+        for v in vals:
+            if _matches(v, _ORGANISM_KEYS):
+                has_organism = True
+            for kw in _HEADER_KEYWORDS:
+                if kw in v and kw not in matched:
+                    matched.add(kw)
+                    score += 1
+                    break
+            else:
+                if (_matches(v, _DATE_KEYS) or _matches(v, _MATERIAL_KEYS)
+                        or _matches(v, _PATIENT_KEYS)):
+                    other_hits += 1
+        # Комбинированный признак: микроорганизм + любой другой служебный столбец
+        if has_organism and (other_hits >= 1 or len(matched) >= 1):
+            score += 3
+        if score >= 2 and score > best_score:
+            best_idx, best_score = i, score
+    return best_idx
+
+
+def detect_ab_name_row(df_raw, organism_pos, header_row_idx, log_func=None):
+    """Автоопределение строки с названиями антибиотиков.
+
+    Не требуется, чтобы названия лежали в фиксированной 7-й строке: ищем строку
+    (в пределах ~25 строк от начала), содержащую максимум текстовых значений
+    в области столбцов антибиотиков.
+    """
+    ncols = df_raw.shape[1]
+    start = organism_pos + 1
+    if start >= ncols:
+        return header_row_idx
+
+    def count_names(r):
+        cnt = 0
+        for j in range(start, ncols):
+            v = df_raw.iat[r, j]
+            if pd.notna(v):
+                s = str(v).strip()
+                if s and not s.isdigit() and _norm(s) not in ('nan', 'none', 'rsi', 's', 'i', 'r', 'нд'):
+                    cnt += 1
+        return cnt
+
+    best_r, best_c = None, 0
+    for r in range(0, min(len(df_raw), max(header_row_idx + 2, 26))):
+        c = count_names(r)
+        if c > best_c:
+            best_r, best_c = r, c
+    if best_c >= 3 and best_r is not None:
+        if log_func:
+            log_func(f"Строка с названиями антибиотиков определена автоматически: №{best_r + 1}")
+        return best_r
+    if log_func:
+        log_func("Не удалось уверенно найти строку с названиями антибиотиков — "
+                 "используем строку сразу под заголовками.")
+    return min(header_row_idx + 1, len(df_raw) - 1)
+
+
 def load_data(filepath, log_func=None):
     if log_func:
-        log_func("Чтение файла...")
-    df_raw = pd.read_excel(filepath, sheet_name='TDSheet', header=None)
+        log_func("Чтение файла…")
+    try:
+        xl = pd.ExcelFile(filepath)
+    except ValueError as e:
+        # Старый формат .xls под Windows может определяться как ZIP (xlsx)
+        msg = str(e)
+        if 'zip' in msg.lower():
+            try:
+                xl = pd.ExcelFile(filepath, engine='openpyxl')
+            except Exception:
+                xl = pd.ExcelFile(filepath, engine='xlrd')
+        else:
+            raise
 
-    # Находим строку с "Заказ"
-    header_row_idx = None
-    for i, row in df_raw.iterrows():
-        if pd.notna(row[0]) and str(row[0]).strip() == 'Заказ':
-            header_row_idx = i
-            break
+    # Лист и строка заголовков определяются автоматически —
+    # требования к имени листа и расположению таблицы смягчены
+    df_raw, header_row_idx = pick_sheet(xl, log_func=log_func)
     if header_row_idx is None:
-        raise ValueError("Не найдена строка с заголовком 'Заказ'")
+        raise ValueError(
+            "Не найдена строка с заголовками таблицы. Ожидаются колонки вида "
+            "«Заказ / История болезни», «Дата», «Материал», «Микроорганизм»."
+        )
+    if log_func:
+        log_func(f"Строка заголовков найдена: №{header_row_idx + 1}")
 
-    # Основные заголовки берём из строки с "Заказ"
+    # Основные заголовки берём из найденной строки
     headers = df_raw.iloc[header_row_idx].values
     data = df_raw.iloc[header_row_idx + 1:].reset_index(drop=True)
     data.columns = headers
 
-    # Переименовываем основные колонки
+    # Переименовываем основные колонки (в т.ч. по синонимам — без точного совпадения)
     rename_map = {}
+    taken = set()
     for col in data.columns:
         col_str = str(col).strip()
+        c_low = _norm(col_str)
         if col_str in ('История болезни', 'patient_id'):
             rename_map[col] = 'patient_id'
+            taken.add('patient_id')
         elif col_str in ('Дата', 'date'):
             rename_map[col] = 'date'
+            taken.add('date')
         elif col_str in ('Материал', 'material_raw'):
             rename_map[col] = 'material_raw'
+            taken.add('material_raw')
         elif col_str in ('Микроорганизм', 'organism'):
             rename_map[col] = 'organism'
+            taken.add('organism')
         elif col_str in ('ФИО', 'fio'):
             rename_map[col] = 'fio'
+        else:
+            # мягкое сопоставление по ключевым словам (первое подходящее имя выигрывает)
+            if 'organism' not in taken and _matches(c_low, _ORGANISM_KEYS):
+                rename_map[col] = 'organism'
+                taken.add('organism')
+            elif 'date' not in taken and _matches(c_low, _DATE_KEYS):
+                rename_map[col] = 'date'
+                taken.add('date')
+            elif 'material_raw' not in taken and _matches(c_low, _MATERIAL_KEYS):
+                rename_map[col] = 'material_raw'
+                taken.add('material_raw')
+            elif 'patient_id' not in taken and _matches(c_low, _PATIENT_KEYS):
+                rename_map[col] = 'patient_id'
+                taken.add('patient_id')
     data = data.rename(columns=rename_map)
 
-    # Поиск столбца с микроорганизмом
+    # Поиск столбца с микроорганизмом (расширенный, без жёстких названий)
     if 'organism' not in data.columns:
         for col in data.columns:
-            if 'микро' in str(col).lower() or 'organism' in str(col).lower():
+            c_low = _norm(col)
+            if ('микро' in c_low or 'organism' in c_low or 'возбудитель' in c_low
+                    or 'идентификац' in c_low or 'вид' == c_low):
                 data = data.rename(columns={col: 'organism'})
                 break
         else:
-            raise ValueError("Не найден столбец с микроорганизмом")
+            raise ValueError(
+                "Не найден столбец с микроорганизмом. Добавьте колонку с названием "
+                "вида (например, «Микроорганизм» / «Возбудитель»)."
+            )
 
-    # Поиск столбца с датой
+    # Поиск столбца с датой (необязателен — при отсутствии заполняется пропуском)
     if 'date' not in data.columns:
         for col in data.columns:
-            if 'дат' in str(col).lower():
+            if 'дат' in _norm(col):
                 data = data.rename(columns={col: 'date'})
                 break
         else:
-            raise ValueError("Не найден столбец с датой")
+            if log_func:
+                log_func("Столбец с датой не найден — статистика по датам будет недоступна.")
+            data['date'] = pd.NaT
 
-    # Поиск столбца с материалом
+    # Поиск столбца с материалом (необязателен — при отсутствии используется «прочее»)
     if 'material_raw' not in data.columns:
         for col in data.columns:
-            if 'матер' in str(col).lower():
+            c_low = _norm(col)
+            if 'матер' in c_low or 'биоматеріал' in c_low or 'локализ' in c_low or 'object' in c_low:
                 data = data.rename(columns={col: 'material_raw'})
                 break
         else:
-            raise ValueError("Не найден столбец с материалом")
+            if log_func:
+                log_func("Столбец с материалом не найден — все пробы будут отнесены к категории «другие».")
+            data['material_raw'] = 'прочее'
 
     # Поиск столбца с пациентом (добавлена отказоустойчивость)
     if 'patient_id' not in data.columns:
@@ -99,12 +269,13 @@ def load_data(filepath, log_func=None):
             organism_pos = i
             break
     if organism_pos is None:
-        raise ValueError("Не удалось определить позицию столбца 'organism'")
+        raise ValueError("Не удалось определить позицию столбца с микроорганизмом")
 
-    # Строка с названиями антибиотиков (индекс 6, как в исходном коде)
-    ab_name_row = 6
+    # Строка с названиями антибиотиков определяется автоматически —
+    # больше не требуется фиксированное расположение (7-я строка)
+    ab_name_row = detect_ab_name_row(df_raw, organism_pos, header_row_idx, log_func=log_func)
     if log_func:
-        log_func(f"Используем строку {ab_name_row} для названий антибиотиков")
+        log_func(f"Используем строку {ab_name_row + 1} для названий антибиотиков")
         sample_cells = []
         for j in range(organism_pos+1, min(organism_pos+11, len(df_raw.columns))):
             val = df_raw.iloc[ab_name_row, j] if ab_name_row < len(df_raw) else ''
@@ -149,7 +320,10 @@ def load_data(filepath, log_func=None):
         lambda x: False if pd.isna(x) or str(x).strip().lower() in ('', 'роста нет', 'нет роста') else True
     )
 
-    data = data.dropna(subset=['date', 'material_raw'])
+    data = data.dropna(subset=['material_raw'])
+    # Пустые строки (без микроорганизма и без антибиотикограммы) отбрасываем,
+    # но наличие даты больше не является обязательным
+    data = data[~(data['organism'].isna() & ~data['diagnostic'])]
     data['material_raw'] = data['material_raw'].astype(str).str.strip()
     data['patient_id'] = data['patient_id'].astype(str).str.strip()
 
