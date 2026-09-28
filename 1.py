@@ -15,7 +15,8 @@ from datetime import datetime
 import customtkinter as ctk
 from tkinter import filedialog
 
-from app_core import run_pipeline
+from app_core import run_pipeline, load_data
+from sheet_builder import SheetBuilderDialog
 
 ctk.set_appearance_mode("dark")          # "dark", "light" или "system"
 ctk.set_default_color_theme("blue")      # blue / green / dark-blue
@@ -37,6 +38,9 @@ class App(ctk.CTk):
         self._processing = False
         self._finished = threading.Event()
         self._finished_ok = False
+        # Конструктор дополнительных листов
+        self._sheet_specs = []          # спецификации из конструктора
+        self._antibiotics_cache = []    # антибиотики последнего загруженного файла
 
         self._build_ui()
         self.after(100, self._poll_log_queue)
@@ -96,14 +100,26 @@ class App(ctk.CTk):
         ctk.CTkButton(inner, text="Сохранить как…", width=110, command=self.select_output
                       ).grid(row=3, column=2, sticky="e")
 
-        # Опции + кнопки запуска
+        # Конструктор листов + опции + кнопки запуска
         actions = ctk.CTkFrame(body, fg_color="transparent")
         actions.pack(fill="x", pady=(0, 10))
+
+        self.builder_btn = ctk.CTkButton(actions, text="🧩 Конструктор листов…",
+                                         width=200, height=40, corner_radius=10,
+                                         fg_color="#3B82F6", hover_color="#2f6ad0",
+                                         font=ctk.CTkFont(size=14, weight="bold"),
+                                         command=self.open_sheet_builder)
+        self.builder_btn.pack(side="left", padx=4)
+
+        self.builder_info = ctk.CTkLabel(actions, text="доп. листов: 0",
+                                         font=ctk.CTkFont(size=12),
+                                         text_color=("gray40", "gray65"))
+        self.builder_info.pack(side="left", padx=(2, 10))
 
         self.styled_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(actions, text="Красивое оформление Excel (шапки, зебра, подсветка %)",
                       variable=self.styled_var, font=ctk.CTkFont(size=13)
-                      ).pack(side="left", padx=6)
+                      ).pack(side="right", padx=6)
 
         self.run_btn = ctk.CTkButton(actions, text="▶  Запустить обработку",
                                      width=220, height=40, corner_radius=10,
@@ -156,6 +172,35 @@ class App(ctk.CTk):
                 name, _ = os.path.splitext(basename)
                 stamp = datetime.now().strftime("%Y%m%d_%H%M")
                 self.output_file.set(os.path.join(dirname, f"{name}_обработанный_{stamp}.xlsx"))
+            # фоновое определение антибиотиков — чтобы конструктор сразу знал список
+            self._antibiotics_cache = []
+            threading.Thread(target=self._scan_antibiotics, args=(filename,),
+                             daemon=True).start()
+
+    def _scan_antibiotics(self, path):
+        try:
+            _, _, _, antibiotics, _ = load_data(path, log_func=None)
+            self._antibiotics_cache = list(antibiotics)
+            self._log_queue.put(f"Список антибиотиков обновлён: {len(antibiotics)} шт. "
+                                f"(для конструктора листов)")
+        except Exception as e:
+            self._antibiotics_cache = []
+            self._log_queue.put(f"Не удалось заранее прочитать антибиотики: {e}")
+
+    # ------------------------------------------------------------------
+    # Конструктор дополнительных листов
+    # ------------------------------------------------------------------
+    def open_sheet_builder(self):
+        dlg = SheetBuilderDialog(self,
+                                 antibiotics_getter=lambda: self._antibiotics_cache)
+        dlg.wait_window()
+        if dlg.specs is not None:  # нажата кнопка «Применить»
+            self._sheet_specs = dlg.specs
+            n = len(self._sheet_specs)
+            self.builder_info.configure(text=f"доп. листов: {n}")
+            names = ", ".join(s["name"] for s in self._sheet_specs[:5])
+            self.log(f"Конструктор: добавлено листов — {n} ({names})"
+                     + ("…" if n > 5 else ""))
 
     def select_output(self):
         filename = filedialog.asksaveasfilename(
@@ -203,6 +248,7 @@ class App(ctk.CTk):
             return
 
         styled = bool(self.styled_var.get())
+        specs = list(self._sheet_specs)
 
         self._processing = True
         self.run_btn.configure(state="disabled", text="Обработка…", fg_color="gray45")
@@ -211,15 +257,20 @@ class App(ctk.CTk):
         self.log_area.configure(state="disabled")
         self.progress.start()
         self.log("Начало обработки...")
+        if specs:
+            self.log(f"План: 3 базовых листа + {len(specs)} из конструктора: "
+                     + ", ".join(s['name'] for s in specs))
 
-        thread = threading.Thread(target=self._task, args=(input_path, output_path, styled),
+        thread = threading.Thread(target=self._task,
+                                  args=(input_path, output_path, styled, specs),
                                   daemon=True)
         thread.start()
 
-    def _task(self, input_path, output_path, styled):
+    def _task(self, input_path, output_path, styled, specs):
         # Из фонового потока не трогаем Tk напрямую — только очередь и флаг.
         try:
-            run_pipeline(input_path, output_path, styled=styled, log_func=self.log)
+            run_pipeline(input_path, output_path, styled=styled, log_func=self.log,
+                         extra_sheets=specs)
             self._log_queue.put(f"Результат сохранён: {output_path}")
             self._finished_ok = True
         except Exception as e:

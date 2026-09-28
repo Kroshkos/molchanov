@@ -642,46 +642,381 @@ def build_wound_sheet5(data, antibiotics, ab_indices, log_func=None):
     return sheet5, wound_data
 
 
-def run_pipeline(input_path, output_path, styled=True, log_func=None):
-    """Полный цикл обработки: загрузка -> листы 2..5 -> сохранение в Excel."""
+# ----------------------------------------------------------------------
+# 7b. Конструктор дополнительных листов
+#     Первые 3 листа отчёта всегда базовые; дополнительные листы
+#     описываются словарями-спецификациями и строятся функциями ниже.
+# ----------------------------------------------------------------------
+
+#: Доступные поля для группировки в конструкторе: (ключ, отображаемое имя)
+GROUP_FIELDS = [
+    ('organism', 'Микроорганизм'),
+    ('material_raw', 'Материал / локализация'),
+    ('category', 'Категория материала'),
+    ('year', 'Год'),
+    ('month', 'Месяц'),
+    ('quarter', 'Квартал'),
+    ('weekday', 'День недели'),
+]
+
+#: Доступные метрики: (ключ, отображаемое имя)
+METRIC_OPTIONS = [
+    ('total', 'Всего проб'),
+    ('positive', 'Проб с ростом'),
+    ('pct_positive', '% положительных'),
+    ('diagnostic', 'Диагностичных'),
+    ('pct_diagnostic', '% диагностичных'),
+    ('patients', 'Уникальных пациентов'),
+]
+
+#: Метрики антибиотикограммы (считаются отдельно, по выбранному антибиотику)
+AB_METRICS = ['S', 'I', 'R', 'НД']
+
+#: Фильтры: (ключ, отображаемое имя)
+FILTER_OPTIONS = [
+    ('none', 'Без фильтра'),
+    ('positive_only', 'Только пробы с ростом'),
+    ('diagnostic_only', 'Только диагностичные'),
+    ('wounds_only', 'Только раны'),
+    ('urine_only', 'Только моча'),
+    ('sputum_only', 'Только мокрота и т.д.'),
+    ('blood_cat_only', 'Только кровь и катетеры'),
+]
+
+_MONTH_NAMES = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+                'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь']
+_WEEKDAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг',
+                  'Пятница', 'Суббота', 'Воскресенье']
+
+
+def prepare_base_table(df_main, data=None):
+    """Возвращает копию данных с доп. полями для конструктора:
+    category (категория материала), year/month/quarter/weekday (из даты)."""
+    base = df_main.copy()
+    base['category'] = base['material_raw'].apply(lambda x: categorize_material(str(x))[0])
+    # подстраховка: если в df_main нет колонки 'organism', берём её из полных данных
+    if 'organism' not in base.columns and data is not None and 'organism' in data.columns:
+        base['organism'] = data['organism'].values[:len(base)]
+
+    def _year(d):
+        return d.year if pd.notna(d) and not pd.isna(d) else None
+    base['year'] = base['date'].apply(_year)
+    base['month'] = base['date'].apply(
+        lambda d: _MONTH_NAMES[d.month - 1] if pd.notna(d) and not pd.isna(d) else 'без даты')
+    base['quarter'] = base['date'].apply(
+        lambda d: f'Q{(d.month - 1) // 3 + 1} {d.year}' if pd.notna(d) and not pd.isna(d) else 'без даты')
+    base['weekday'] = base['date'].apply(
+        lambda d: _WEEKDAY_NAMES[d.weekday()] if pd.notna(d) and not pd.isna(d) else 'без даты')
+    # сортировка месяцев по календарю
+    base['_month_order'] = base['date'].apply(
+        lambda d: d.month if pd.notna(d) and not pd.isna(d) else 99)
+    return base
+
+
+def apply_spec_filter(base_df, spec):
+    """Применяет фильтр спецификации листа к таблице посевов."""
+    ftype = spec.get('filter', 'none')
+    df = base_df
+    if ftype == 'positive_only':
+        df = df[df['is_positive']]
+    elif ftype == 'diagnostic_only':
+        df = df[df['diagnostic']]
+    elif ftype == 'wounds_only':
+        df = df[df['category'] == 'РАНЫ']
+    elif ftype == 'urine_only':
+        df = df[df['category'] == 'моча']
+    elif ftype == 'sputum_only':
+        df = df[df['category'] == 'мокрота и т.д.']
+    elif ftype == 'blood_cat_only':
+        df = df[df['category'].isin(['кровь', 'катетер'])]
+    elif ftype.startswith('organism='):
+        org = ftype.split('=', 1)[1].strip().lower()
+        df = df[df['organism'].astype(str).str.strip().str.lower() == org]
+    return df.copy()
+
+
+def compute_group_stats(df, group_cols):
+    """Сводная статистика по выбранным полям группировки (метрики посева)."""
+    gb = df.groupby(group_cols, dropna=False)
+    out = pd.DataFrame({
+        'Всего проб': gb.size(),
+        'Проб с ростом': gb['is_positive'].sum(),
+        'Диагностичных': gb.apply(
+            lambda g: int((g['is_positive'] & g['diagnostic']).sum()), include_groups=False),
+        'Пациентов': gb['patient_id'].nunique(),
+    })
+    import numpy as np
+    total = out['Всего проб'].astype(float)
+    pos = out['Проб с ростом'].astype(float)
+    diag = out['Диагностичных'].astype(float)
+    out['% положительных'] = (pos / total.replace(0, np.nan) * 100).round(1).fillna(0)
+    out['% диагностичных'] = (diag / pos.replace(0, np.nan) * 100).round(1).fillna(0)
+    return out.reset_index()
+
+
+def compute_ab_group_stats(data, antibiotics, ab_indices, group_cols, antibiotic,
+                           only_positive=True, base_df=None):
+    """Статистика S/I/R/НД по выбранному антибиотику для заданных полей группировки.
+
+    Если среди group_cols есть производные поля (category, month, quarter, year,
+    weekday), они подтягиваются из base_df (таблица prepare_base_table).
+    """
+    if antibiotic not in antibiotics:
+        raise ValueError(f"Антибиотик «{antibiotic}» не найден в исходном файле.")
+    i = antibiotics.index(antibiotic)
+    col_idx = ab_indices[i]
+    df = data[data['is_positive']].copy() if only_positive else data.copy()
+    # добавляем производные поля из базовой таблицы (позиционно совпадают строки)
+    derived = [g for g in group_cols if g in ('category', 'year', 'month', 'quarter', 'weekday')]
+    if derived and base_df is not None:
+        for g in derived:
+            if g not in df.columns and g in base_df.columns:
+                df[g] = base_df[g].values[:len(df)] if len(base_df) >= len(df) else \
+                    pd.Series(base_df[g].values[:len(df)]).reindex(df.index).values
+    df['_rsi'] = df.iloc[:, col_idx].apply(
+        lambda v: str(v).strip().upper() if isinstance(v, str) else None)
+    # группировка только по непустым RSI ('' от «Роста нет» в столбце антибиотика — не категория)
+    df = df[df['_rsi'].isin(AB_METRICS)]
+    counts = (df.groupby(group_cols + ['_rsi'], dropna=False).size()
+              .unstack('_rsi', fill_value=0))
+    for m in AB_METRICS:
+        if m not in counts.columns:
+            counts[m] = 0
+    counts = counts[AB_METRICS]
+    counts['Total'] = counts.sum(axis=1)
+    import numpy as np
+    total_f = counts['Total'].astype(float).replace(0, np.nan)
+    for m in AB_METRICS:
+        counts[f'{m}%'] = (counts[m].astype(float) / total_f * 100).round(1).fillna(0)
+    return counts.reset_index()
+
+
+def sort_by_month(df, month_col='Месяц'):
+    """Сортирует строки по календарному порядку месяцев (для группировки «Месяц»)."""
+    order = {name: k for k, name in enumerate(_MONTH_NAMES, start=1)}
+    tmp = df.copy()
+    tmp['_mo'] = tmp[month_col].map(order).fillna(99)
+    return tmp.sort_values('_mo').drop(columns='_mo').reset_index(drop=True)
+
+
+def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func=None):
+    """Строит один дополнительный лист по спецификации конструктора.
+
+    Спецификация — словарь:
+      name        — имя листа Excel
+      groups      — список полей группировки (ключи GROUP_FIELDS)
+      metrics     — список метрик; если содержит 'ab', считается антибиотикограмма
+      antibiotic  — название антибиотика (когда metrics включает 'ab')
+      filter      — ключ фильтра (FILTER_OPTIONS)
+    Возвращает DataFrame или None, если лист построить не удалось.
+    """
+    groups = [g for g in spec.get('groups', []) if g in dict(GROUP_FIELDS)]
+    if not groups:
+        if log_func:
+            log_func(f"Лист «{spec.get('name')}»: не выбраны поля группировки — лист пропущен.")
+        return None
+
+    filtered = apply_spec_filter(base_df, spec)
+    if filtered.empty:
+        if log_func:
+            log_func(f"Лист «{spec.get('name')}»: нет данных после применения фильтра.")
+
+    _metric_keys = {k for k, _ in METRIC_OPTIONS}
+    metrics = [m for m in spec.get('metrics', []) if m == 'ab' or m in _metric_keys]
+    if not metrics:
+        # метрики не выбраны (или выбраны недопустимо) — берём базовый набор
+        metrics = ['total', 'positive', 'pct_positive']
+        if log_func:
+            log_func(f"Лист «{spec.get('name')}»: метрики не выбраны — применён "
+                     f"набор по умолчанию (всего проб / с ростом / % положительных).")
+    frames = []
+
+    if any(m in _metric_keys for m in metrics):
+        stats = compute_group_stats(filtered, groups)
+        keep = list(groups) + [label for key, label in METRIC_OPTIONS if key in metrics]
+        frames.append(stats[[c for c in keep if c in stats.columns]])
+
+    if 'ab' in metrics:
+        ab_name = spec.get('antibiotic', '')
+        try:
+            ab_stats = compute_ab_group_stats(data, antibiotics, ab_indices, groups,
+                                              ab_name, base_df=base_df)
+            frames.append(ab_stats)
+        except ValueError as e:
+            if log_func:
+                log_func(f"Лист «{spec.get('name')}»: {e}")
+
+    if not frames:
+        if log_func:
+            log_func(f"Лист «{spec.get('name')}»: не выбрано ни одной метрики — лист пропущен.")
+        return None
+
+    result = frames[0]
+    for f in frames[1:]:
+        result = result.merge(f, on=groups, how='outer')
+
+    # переименуем технические имена группировок в человекочитаемые
+    labels = dict(GROUP_FIELDS)
+    result = result.rename(columns={g: labels[g] for g in groups})
+    display_cols = [labels[g] for g in groups]
+
+    # упорядочиваем столбцы: сначала группы, затем остальное
+    other = [c for c in result.columns if c not in display_cols]
+    result = result[display_cols + other]
+
+    # сортировки
+    if 'month' in groups:
+        result = sort_by_month(result, labels['month'])
+    elif 'year' in groups and 'year' in result.columns:
+        result = result.sort_values(labels['year'])
+    elif 'quarter' in groups:
+        result = result.sort_values(labels['quarter'])
+    else:
+        num_cols = [c for c in other if c == 'Всего проб']
+        if num_cols:
+            result = result.sort_values(num_cols[0], ascending=False)
+        else:
+            result = result.sort_values(result.columns[-1], ascending=False)
+    result = result.reset_index(drop=True)
+
+    if log_func:
+        log_func(f"Лист «{spec.get('name')}»: {len(result)} строк "
+                 f"(группировка: {', '.join(labels[g] for g in groups)}).")
+    return result
+
+
+def sanitize_sheet_name(name):
+    """Делает имя листа допустимым для Excel: убирает запрещённые символы,
+    ограничивает длину 31 символом. Пустое имя заменяется на «Лист»."""
+    bad = set(':\\/?*[]')
+    cleaned = ''.join(ch for ch in str(name) if ch not in bad).strip()
+    return cleaned[:31] if cleaned else 'Лист'
+
+
+def validate_spec(spec, available_antibiotics=None):
+    """Проверяет спецификацию листа; возвращает список сообщений об ошибках.
+
+    Название автокорректируется (санитизируется), отсутствие метрик не является
+    ошибкой — применится набор по умолчанию.
+    """
+    errors = []
+    name = sanitize_sheet_name(str(spec.get('name', '')).strip())
+    if len(name) > 31:
+        errors.append("Название листа не должно превышать 31 символ.")
+    if not spec.get('groups'):
+        errors.append("Выберите хотя бы одно поле группировки.")
+    metrics = [m for m in spec.get('metrics', [])
+               if m == 'ab' or m in {k for k, _ in METRIC_OPTIONS}]
+    if 'ab' in metrics:
+        ab = spec.get('antibiotic', '')
+        if not ab:
+            errors.append("Для метрики «антибиотикограмма» выберите антибиотик.")
+        elif available_antibiotics is not None and ab not in available_antibiotics:
+            errors.append(f"Антибиотик «{ab}» отсутствует в текущем исходном файле.")
+    return errors
+
+
+# --- Пресеты конструктора (сохранение/загрузка настроек листов) -----------
+
+def save_sheet_specs(specs, path):
+    """Сохраняет список спецификаций листов в JSON-файл."""
+    import json
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(list(specs), f, ensure_ascii=False, indent=2)
+
+
+def load_sheet_specs(path):
+    """Загружает список спецификаций листов из JSON-файла."""
+    import json
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = data.get('sheets', [])
+    specs = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        specs.append({
+            'name': str(item.get('name', '')),
+            'groups': list(item.get('groups', [])),
+            'metrics': list(item.get('metrics', [])),
+            'antibiotic': str(item.get('antibiotic', '')),
+            'filter': str(item.get('filter', 'none')),
+        })
+    return specs
+
+
+def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_sheets=None):
+    """Полный цикл обработки: загрузка -> базовые листы -> конструктор -> Excel.
+
+    extra_sheets — список спецификаций конструктора (дополнительные листы
+    после трёх базовых). Каждое описание проверяется validate_spec().
+    """
     df_main, ab_data, data, antibiotics, ab_indices = load_data(input_path, log_func=log_func)
 
     if log_func:
-        log_func("Формирование листа 2 (анализ посевов по категориям)...")
+        log_func("Формирование листа 1 (анализ посевов по категориям)...")
     sheet2 = generate_sheet2(df_main, log_func=log_func)
 
     if log_func:
-        log_func("Формирование листа 3 (эпидемиология по локализациям)...")
+        log_func("Формирование листа 2 (эпидемиология по локализациям)...")
     sheet3 = generate_sheet3(df_main, log_func=log_func)
 
     if log_func:
-        log_func("Формирование листа 4 (общая антибиотикорезистентность)...")
+        log_func("Формирование листа 3 (общая антибиотикорезистентность)...")
     sheet4 = generate_antibiotic_sheet(ab_data, log_func=log_func)
 
     if log_func:
-        log_func("Формирование листа 5 (раневые антибиотики с локализацией)...")
+        log_func("Формирование листа «Раны (антибиотики)»...")
     sheet5, wound_data = build_wound_sheet5(data, antibiotics, ab_indices, log_func=log_func)
+
+    # Листы конструктора
+    built_sheets = {}
+    if extra_sheets:
+        base = prepare_base_table(df_main, data)
+        used_names = {'1', '2', '3', 'Раны (антибиотики)'}
+        for n, spec in enumerate(extra_sheets, start=1):
+            errs = validate_spec(spec, available_antibiotics=antibiotics)
+            if errs:
+                if log_func:
+                    log_func(f"Лист №{n}: {errs[0]} — лист пропущен.")
+                continue
+            df_sheet = build_sheet_from_spec(spec, base, data, antibiotics, ab_indices,
+                                             log_func=log_func)
+            if df_sheet is not None and not df_sheet.empty:
+                nm = sanitize_sheet_name(str(spec['name']).strip())
+                k = 1
+                while nm in used_names:
+                    k += 1
+                    nm = f"{sanitize_sheet_name(str(spec['name']).strip())[:28]}_{k}"
+                used_names.add(nm)
+                built_sheets[nm] = df_sheet
 
     save_to_excel(sheet2, sheet3, sheet4, sheet5, output_path,
                   log_func=log_func, styled=styled,
-                  raw_data=data, wound_data=wound_data)
+                  raw_data=data, wound_data=wound_data,
+                  user_sheets=built_sheets)
 
     if log_func:
         log_func("Обработка успешно завершена!")
     return dict(df_main=df_main, ab_data=ab_data, sheet2=sheet2, sheet3=sheet3,
-                sheet4=sheet4, sheet5=sheet5)
+                sheet4=sheet4, sheet5=sheet5, user_sheets=built_sheets)
 
 # ----------------------------------------------------------------------
 # 8. Сохранение в Excel
 # ----------------------------------------------------------------------
 
 def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, sheet5_df, output_file,
-                  log_func=None, styled=False, raw_data=None, wound_data=None):
+                  log_func=None, styled=False, raw_data=None, wound_data=None,
+                  user_sheets=None):
     """
     Сохраняет аналитические листы в Excel.
-    styled=True — современное оформление (шапки, зебра, заморозка панелей,
-    условное форматирование % чувствительности) + дополнительные листы
+    Первые три листа всегда базовые: «1» (анализ посевов), «2» (эпидемиология),
+    «3» (резистентность). Дополнительно сохраняются лист «Раны (антибиотики)»,
+    листы конструктора (user_sheets — dict {имя: DataFrame}) и при styled=True —
     «Сводка» и «Данные».
+    styled=True — современное оформление (шапки, зебра, заморозка панелей,
+    условное форматирование % чувствительности).
     """
     if log_func:
         log_func(f"Сохранение в {output_file}...")
@@ -689,10 +1024,12 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, sheet5_df, output_file,
     if dirname:
         os.makedirs(dirname, exist_ok=True)
 
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        sheet2_df.to_excel(writer, sheet_name='2', index=False)
+    user_sheets = user_sheets or {}
 
-        # Лист 3
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        sheet2_df.to_excel(writer, sheet_name='1', index=False)
+
+        # Лист 2
         sheet3_rows = []
         for section_name, section_df in sheet3_dict.items():
             sheet3_rows.append([section_name] + [''] * (len(section_df.columns)-1))
@@ -706,18 +1043,22 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, sheet5_df, output_file,
                 if len(row) < max_cols:
                     row.extend([''] * (max_cols - len(row)))
             sheet3_combined = pd.DataFrame(sheet3_rows)
-            sheet3_combined.to_excel(writer, sheet_name='3', index=False, header=False)
+            sheet3_combined.to_excel(writer, sheet_name='2', index=False, header=False)
 
-        # Лист 4
+        # Лист 3
         if not sheet4_df.empty:
-            sheet4_df.to_excel(writer, sheet_name='4', index=False, header=False)
+            sheet4_df.to_excel(writer, sheet_name='3', index=False, header=False)
 
-        # Лист 5 (раневые антибиотики с локализацией)
+        # Лист «Раны (антибиотики)» (ранее — лист 5)
         if not sheet5_df.empty:
-            sheet5_df.to_excel(writer, sheet_name='5', index=False, header=False)
+            sheet5_df.to_excel(writer, sheet_name='Раны (антибиотики)', index=False, header=False)
 
+        # Листы конструктора
+        for name, df_sheet in user_sheets.items():
+            df_sheet.to_excel(writer, sheet_name=name[:31], index=False)
+
+        extra_sheets = list(user_sheets.keys())
         if styled:
-            extra_sheets = []
             summary_df = _build_summary(raw_data, sheet2_df)
             if summary_df is not None:
                 summary_df.to_excel(writer, sheet_name='Сводка', index=False)
@@ -794,7 +1135,11 @@ def _write_raw_sheet(raw_data, writer):
 
 
 def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_sheets):
-    """Современное оформление книги: шапки, зебра, числовые форматы, панели."""
+    """Современное оформление книги: шапки, зебра, числовые форматы, панели.
+
+    extra_sheets — имена дополнительных листов (конструктор, «Сводка», «Данные»),
+    оформляемых как простые таблицы с шапкой; для листа «Раны (антибиотики)»
+    применяется блочное оформление антибиотикограмм."""
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.formatting.rule import CellIsRule
     from openpyxl.utils import get_column_letter as gcl
@@ -832,8 +1177,9 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_s
         for col, length in widths.items():
             ws.column_dimensions[gcl(col)].width = min(length + 2.5, max_width)
 
-    # --- Сводка / Данные / лист 2: простые таблицы с шапкой -------------
-    simple_with_header = [s for s in ['Сводка', 'Данные', '2'] if s in writer.sheets]
+    # --- Сводка / Данные / листы конструктора / лист 1: простые таблицы ------
+    simple_with_header = [s for s in (['Сводка', 'Данные'] + list(extra_sheets) + ['1'])
+                          if s in writer.sheets]
     for name in simple_with_header:
         ws = writer.sheets[name]
         ncols = ws.max_column
@@ -844,12 +1190,23 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_s
                 cell.border = border_all
                 if r % 2 == 0:
                     cell.fill = zebra_fill
+        # подсветка столбцов процентов (листы конструктора)
+        for c in range(1, ncols + 1):
+            head = ws.cell(row=1, column=c).value
+            if head and str(head).startswith('%'):
+                rng = f"{gcl(c)}2:{gcl(c)}{ws.max_row}"
+                ws.conditional_formatting.add(rng, CellIsRule(
+                    operator='greaterThanOrEqual', formula=['80'],
+                    fill=PatternFill(start_color=GOOD, end_color=GOOD, fill_type='solid')))
+                ws.conditional_formatting.add(rng, CellIsRule(
+                    operator='lessThan', formula=['50'],
+                    fill=PatternFill(start_color=BAD, end_color=BAD, fill_type='solid')))
         ws.freeze_panes = "A2"
         autofit(ws)
 
-    # --- Лист 3: секции (заголовок + шапка + строки) ---------------------
-    if '3' in writer.sheets and sheet3_dict:
-        ws = writer.sheets['3']
+    # --- Лист 2: секции (заголовок + шапка + строки) ---------------------
+    if '2' in writer.sheets and sheet3_dict:
+        ws = writer.sheets['2']
         ncols = ws.max_column
         r = 1
         max_row = ws.max_row
@@ -895,8 +1252,8 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, sheet5_df, extra_s
                 r += 1
         autofit(ws)
 
-    # --- Листы 4 и 5: блоки «Антибиотик: ...» ----------------------------
-    for name, block_df in (('4', sheet4_df), ('5', sheet5_df)):
+    # --- Листы «3» и «Раны (антибиотики)»: блоки «Антибиотик: ...» --------
+    for name, block_df in (('3', sheet4_df), ('Раны (антибиотики)', sheet5_df)):
         if name not in writer.sheets or block_df is None or block_df.empty:
             continue
         ws = writer.sheets[name]
