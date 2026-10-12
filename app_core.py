@@ -11,8 +11,13 @@ app_core.py — ядро обработки микробиологических
 import os
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 from openpyxl.utils import get_column_letter
+
+#: Специальное значение выбора клиники: обработать все клиники, сохранив
+#: результат для каждой клиники в отдельном файле.
+ALL_CLINICS_LABEL = 'Все клиники'
 
 # ----------------------------------------------------------------------
 # 1. Загрузка и предобработка данных (расширенная)
@@ -293,6 +298,61 @@ def load_data(filepath, log_func=None):
 
     data['date'] = pd.to_datetime(data['date'], errors='coerce', dayfirst=True)
 
+    # ---------------- Определение клиник ----------------
+    # В исходном файле могут быть данные нескольких клиник. Клиника может
+    # задаваться отдельным столбцом (например, «Клиника») либо указываться
+    # в первой колонке вместо служебного слова «Заказ» (встречается в
+    # выгрузках лабораторной системы: в строках блока клиники пишется её
+    # код — «ВМХ», «ВПХ», «ГХ» и т.п.). Колонка 'clinic' добавляется всегда;
+    # если клиник не найдено — все строки получают значение «Все клиники».
+    clinic_col = None
+    for col in data.columns:
+        c_low = _norm(col)
+        if c_low == 'клиника' or ('клиник' in c_low and c_low not in taken):
+            clinic_col = col
+            break
+
+    def _clean_clinic(v):
+        s = str(v).strip() if pd.notna(v) else ''
+        if not s or s.lower() in ('нан', 'none', 'nan') or _norm(s) in _AB_SERVICE_TOKENS:
+            return None
+        return s
+
+    if clinic_col is not None:
+        data['clinic'] = data[clinic_col].apply(_clean_clinic)
+        if log_func:
+            log_func("Клиники определены по столбцу «Клиника».")
+    elif len(data):
+        first_vals = data.iloc[:, 0].map(_clean_clinic)
+        # значениями клиники считаем только короткие строки без пробелов
+        # (коды/аббревиатуры вроде «ВМХ»); длинные фразы — посторонний текст
+        looks_like_clinic = first_vals.notna() & first_vals.map(
+            lambda s: bool(s) and ' ' not in str(s) and len(str(s)) <= 24)
+        clinic_series = pd.Series(None, index=data.index, dtype='object')
+        clinic_series[looks_like_clinic] = first_vals[looks_like_clinic]
+        data['clinic'] = clinic_series
+        if log_func and data['clinic'].notna().any():
+            log_func("Клиники определены по значениям первой колонки таблицы.")
+    else:
+        data['clinic'] = pd.Series(dtype='object')
+
+    found_clinics = sorted({str(c).strip() for c in data.get('clinic', pd.Series(dtype='object')).dropna()})
+    if not found_clinics:
+        data['clinic'] = ALL_CLINICS_LABEL
+        if log_func:
+            log_func("Признаков разделения на клиники не найдено — "
+                     "все данные обработаны как одна выборка.")
+    else:
+        # строки без явного указания клиники относятся к последней указанной
+        # выше по таблице (блоки строк в выгрузке идут под кодом клиники)
+        data['clinic'] = data['clinic'].ffill()
+        data['clinic'] = data['clinic'].fillna(found_clinics[0])
+        counts = data[data['is_positive']].groupby('clinic').size() \
+            if 'is_positive' in data.columns else data.groupby('clinic').size()
+        if log_func:
+            summary = ", ".join(f"{c}: {int(n)}" for c, n in counts.items())
+            log_func(f"Обнаружены клиники ({len(found_clinics)}): {summary}")
+
     # Находим позицию столбца 'organism'
     organism_pos = None
     for i, col in enumerate(data.columns):
@@ -369,7 +429,8 @@ def load_data(filepath, log_func=None):
     data['material_raw'] = data['material_raw'].astype(str).str.strip()
     data['patient_id'] = data['patient_id'].astype(str).str.strip()
 
-    df_main = data[['patient_id', 'date', 'material_raw', 'organism', 'is_positive', 'diagnostic']].copy()
+    df_main = data[['patient_id', 'date', 'material_raw', 'organism',
+                    'is_positive', 'diagnostic', 'clinic']].copy()
 
     # Сбор данных по антибиотикам для всех образцов (группировка только по микроорганизму)
     ab_data = compute_ab_data(data, antibiotics, ab_indices, group_cols=['organism'], log_func=log_func)
@@ -696,6 +757,7 @@ def build_wound_sheet5(data, antibiotics, ab_indices, log_func=None):
 #: одна итоговая строка по всей выборке без разбивки.
 GROUP_FIELDS = [
     ('total', 'Всё вместе (итог без разбивки)'),
+    ('clinic', 'Клиника'),
     ('organism', 'Микроорганизм'),
     ('material_raw', 'Материал / локализация'),
     ('material_organism', 'Материал + микроорганизм'),
@@ -712,6 +774,10 @@ GROUP_FIELDS = [
 
 #: Специальные ключи группировки
 TOTAL_GROUP_KEY = 'total'
+
+#: Специальный режим конструктора: сравнение клиник — антибиотикограмма на
+#: одни и те же микроорганизмы/материал в условиях разных клиник.
+COMPARE_CLINICS_KEY = '__compare_clinics__'
 
 #: Специальное значение в выборе антибиотика: «Все антибиотики» — суммарная
 #: антибиотикограмма по всем АБ-колонкам исходного файла сразу.
@@ -1470,6 +1536,7 @@ def _write_raw_sheet(raw_data, writer):
     df = raw_data.copy()
     cats = df['material_raw'].apply(lambda x: categorize_material(x)[0])
     out = pd.DataFrame({
+        'Клиника': df['clinic'] if 'clinic' in df.columns else ALL_CLINICS_LABEL,
         'Пациент': df['patient_id'],
         'Дата': df['date'].dt.strftime('%d.%m.%Y'),
         'Материал': df['material_raw'],
