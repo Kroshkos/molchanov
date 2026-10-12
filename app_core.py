@@ -1461,6 +1461,22 @@ def filter_data_by_clinic(data, antibiotics, ab_indices, clinic):
 #: Пункт выбора клиники на главном окне: отдельный режим «Сравнение клиник»
 COMPARE_CLINICS_LABEL = '⚖️ Сравнение клиник'
 
+#: Минимальное число ОПРЕДЕЛЁННЫХ ответов (S+I+R), ниже которого доля S%
+#: считается статистически незначимой и в листы сравнения не попадает
+CMP_MIN_SIGNIFICANT = 5
+
+
+def _s_pct_of_defined(s, i, r):
+    """Доля чувствительных среди ОПРЕДЕЛЁННЫХ ответов (S+I+R).
+
+    Именно так считается чувствительность в антибиотикограммах: строки,
+    где антибиотик не испытывался (пусто / только MIC / «нет роста»),
+    в знаменатель не входят — иначе S% искусственно занижается до 1–3%
+    и сравнение клиник теряет смысл.
+    """
+    det = s + i + r
+    return round(s / det * 100, 1) if det else None
+
 
 def get_compare_sheet_names(spec_name):
     """Имена листов режима сравнения: таблица + матрица + графики."""
@@ -1514,10 +1530,17 @@ def count_rows_by_clinic(data):
 def _cmp_block_stats(sub, data, col_i, row_fields, combos):
     """Считает строки блока (клиника × антибиотик) в формате листа 3.
 
-    Возвращает (rows_out, total_row, s_list, labels_out):
-      rows_out  — строки [ключ группы..., S, I, R, НД, Total, S%, I%, R%, НД%];
-      total_row — итоговая строка «ВСЕГО» в том же формате;
-      s_list/labels_out — значения S% и подписи строк для графика.
+    Возвращает (rows_out, total_row, chart_items, labels_out):
+      rows_out    — строки [ключ группы..., S, I, R, НД, Total, n, S%, I%, R%];
+      total_row   — итоговая строка «ВСЕГО» в том же формате;
+      chart_items — [(подпись, S%, n)] только для ЗНАЧИМЫХ строк
+                    (определений S+I+R ≥ CMP_MIN_SIGNIFICANT);
+      labels_out  — все подписи строк блока (для матрицы).
+    Проценты считаются так же, как в базовых листах программы: по
+    ОПРЕДЕЛЁННЫМ ответам (S+I+R), без «НД» в знаменателе — строки, где
+    антибиотик не испытывался, занижали бы чувствительность до единиц
+    процентов. Столбец «n» показывает, из скольких определений получен
+    процент (колонка «НД%» заменена на «n», т.к. НД = Total − n).
     Строки сортируются по общему списку комбинаций (combos), поэтому блоки
     разных клиник содержат одинаковые наборы «микроорганизм × материал»
     в одном порядке — сравнение визуально сопоставимо.
@@ -1563,33 +1586,37 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
         key = tuple(str(r[f]) for f in row_fields) if row_fields else ('Все данные',)
         s, i_, rr, nd = (int(r.get('S', 0)), int(r.get('I', 0)),
                         int(r.get('R', 0)), int(r.get('НД', 0)))
-        tot = s + i_ + rr + nd
-        tf = float(tot) if tot else np.nan
-        pcts = [round(x / tf * 100, 1) if tf == tf else 0.0 for x in (s, i_, rr, nd)]
-        stats[key] = [s, i_, rr, nd, tot] + pcts
+        tot = s + i_ + rr + nd          # всего проб с ростом в ячейке
+        n_def = s + i_ + rr             # определений S+I+R — база для процентов
+        pcts = [_s_pct_of_defined(s, i_, rr), _s_pct_of_defined(i_, rr, s),
+                _s_pct_of_defined(rr, s, i_)]
+        stats[key] = [s, i_, rr, nd, tot, n_def] + pcts
 
-    rows_out, s_list, labels_out = [], [], []
+    rows_out, chart_items, labels_out = [], [], []
     for key in combos:
         if key not in stats:
             continue
         vals = stats[key]
         rows_out.append(list(key) + vals)
-        s_list.append(vals[5])
         lbl = ' | '.join(key) if row_fields else 'Все данные'
         labels_out.append(lbl)
+        # в графики и значимые сравнения — только строки с достаточным числом
+        # определений (иначе процент получен на 1–4 изолятах и несопоставим)
+        if vals[5] >= CMP_MIN_SIGNIFICANT and vals[6] is not None:
+            chart_items.append((lbl, vals[6], vals[5]))
     if not rows_out:
-        return rows_out, None, s_list, labels_out
+        return rows_out, None, chart_items, labels_out
 
     arr = np.array([stats[k] for k in combos if k in stats], dtype=float)
     sums = arr.sum(axis=0)
-    stot = sums[4]
+    stot, sn = sums[4], sums[5]
     total_row = (['ВСЕГО'] * max(len(row_fields), 1) +
-                 [int(sums[0]), int(sums[1]), int(sums[2]), int(sums[3]), int(stot),
-                  round(sums[0] / stot * 100, 1) if stot else 0.0,
-                  round(sums[1] / stot * 100, 1) if stot else 0.0,
-                  round(sums[2] / stot * 100, 1) if stot else 0.0,
-                  round(sums[3] / stot * 100, 1) if stot else 0.0])
-    return rows_out, total_row, s_list, labels_out
+                 [int(sums[0]), int(sums[1]), int(sums[2]), int(sums[3]),
+                  int(stot), int(sn),
+                  _s_pct_of_defined(sums[0], sums[1], sums[2]) or 0.0,
+                  _s_pct_of_defined(sums[1], sums[2], sums[0]) or 0.0,
+                  _s_pct_of_defined(sums[2], sums[0], sums[1]) or 0.0])
+    return rows_out, total_row, chart_items, labels_out
 
 
 def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_func=None):
@@ -1667,19 +1694,20 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             sub = pos[pos['clinic'].astype(str).str.strip() == cl] if 'clinic' in pos.columns else pos
             if sub.empty:
                 continue
-            rows_out, total_row, s_list, labels_out = _cmp_block_stats(
+            rows_out, total_row, chart_items, labels_out = _cmp_block_stats(
                 sub, data, col_i, row_fields, combos)
             if not rows_out:
                 continue
             blocks.append((ab, cl, rows_out, total_row))
-            chart_data.append((ab, cl, list(zip(labels_out, s_list))))
+            # значимые строки (n ≥ CMP_MIN_SIGNIFICANT) — для матрицы и графиков
+            chart_data.append((ab, cl, list(chart_items)))
             for lbl, row_vals in zip(labels_out, rows_out):
                 # Числовые столбцы строки блока после ключей:
-                # [S, I, R, НД, Total, S%, I%, R%, НД%]
+                # [S, I, R, НД, Total, n, S%, I%, R%]
                 nums = row_vals[len(row_fields):]
                 try:
                     answered = sum(int(x) for x in nums[:4])   # S+I+R+НД
-                    defined = sum(int(x) for x in nums[:3])    # S+I+R
+                    defined = int(nums[5])                     # определений S+I+R
                 except (IndexError, TypeError, ValueError):
                     answered, defined = 0, 0
                 block_totals[(ab, cl, lbl)] = answered
@@ -1693,7 +1721,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     header = (['Микроорганизм', 'Локализация'] if len(row_fields) == 2 else
               ['Микроорганизм'] if row_fields == ['organism'] else
               ['Локализация'] if row_fields == ['material_raw'] else ['Группа'])
-    header += AB_METRICS + ['Total'] + [f'{m}%' for m in AB_METRICS]
+    header += AB_METRICS + ['Total', 'n', 'S%', 'I%', 'R%']
     ncol = len(header)
     all_rows = []
     cur_ab = None
@@ -1720,49 +1748,46 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
 
     # --- лист «матрица»: один экран на весь набор сравнения ---
     # Строки: Антибиотик × микроорганизм/материал; колонки: клиники (S%).
-    # Дополнительно: Max−min (разброс между клиниками) и «Разница» — самая
-    # сильная связка «клиника лучше / клиника хуже». Ячейки окрашиваются по
+    # S% считается по ОПРЕДЕЛЁННЫМ ответам (S+I+R); в матрицу попадают только
+    # значимые ячейки — с n ≥ CMP_MIN_SIGNIFICANT. Ячейки окрашиваются по
     # цветовой шкале чувствительности (см. _style_compare_matrix).
     # Статусы ячеек:
-    #   число            — S%, клиника тестировала (определений ≥ CMP_MIN_DEFINED);
-    #   «число* (n)»     — определений меньше порога — значение нестабильно;
-    #   «нет теста»      — посевы были, но антибиотик этой паре не назначался;
-    #   «нет посевов»    — у клиники нет проб с этим микроорганизмом/материалом.
-    s_map = {}          # (ab, label) -> {clinic: S%}
+    #   «42.9% (n=14)» — значение и число определений, из которых оно получено;
+    #   «нет теста»    — посевы были, но антибиотик этой паре не назначался
+    #                    либо определений меньше порога значимости (значения
+    #                    на 1–4 изолятах в сравнении не показываем);
+    #   «нет посевов»  — у клиники нет проб с этим микроорганизмом/материалом.
+    s_map = {}          # (ab, label) -> {clinic: (S%, n)} — только значимые
     n_map = {}          # (ab, label) -> {clinic: получено ответов (S+I+R+НД)}
     d_map = {}          # (ab, label) -> {clinic: определённых ответов (S+I+R)}
-    for ab, cl, pairs in chart_data:
-        for lbl, sv in pairs:
-            s_map.setdefault((ab, lbl), {})[cl] = sv
+    for ab, cl, items in chart_data:
+        for lbl, sv, nv in items:
+            s_map.setdefault((ab, lbl), {})[cl] = (sv, nv)
     for (ab, cl, lbl), tot in block_totals.items():
         n_map.setdefault((ab, lbl), {})[cl] = tot
     for (ab, cl, lbl), dv in block_defines.items():
         d_map.setdefault((ab, lbl), {})[cl] = dv
 
-    def _cell_status(ab, lbl, cl, v):
+    def _cell_status(ab, lbl, cl):
         """(текст ячейки, статус) — статус используется стилем и легендой."""
         nn = n_map.get((ab, lbl), {}).get(cl, 0)
         nd = d_map.get((ab, lbl), {}).get(cl, 0)
-        if v is None or nn <= 0:
+        got = s_map.get((ab, lbl), {}).get(cl)
+        if nn <= 0 and nd <= 0:
             return 'нет посевов', 'no_cultures'
-        if nd < CMP_MIN_DEFINED:
+        if got is None:
             return 'нет теста', 'no_test'
-        if nd < MIN_N_LABEL:
-            return f"{round(v, 1)}* ({nd})", 'low_n'
-        return round(v, 1), 'ok'
+        return f"{got[0]}% (n={got[1]})", 'ok'
 
     matrix_rows = []
     diff_rows = []      # (abs(d), row_values) — для сводки различий
     used_statuses = set()
     for ab in selected_abs:
-        # в матрицу попадают только наборы «микроорганизм / материал», по
-        # которым ХОТЬ ОДНА клиника реально тестировала антибиотик (есть
-        # определения S/I/R). Наборы без единого теста (и строки, где все
-        # клиники показали бы «нет посевов»/«нет теста») из таблицы исключаются.
-        labels_ab = sorted(
-            lbl for lbl in {l for (a, l) in s_map if a == ab}
-            if any(d_map.get((ab, lbl), {}).get(cl, 0) >= CMP_MIN_DEFINED
-                   for cl in clinics))
+        # в матрицу попадают только наборы «микроорганизм / материал», по которым
+        # ХОТЬ ОДНА клиника получила ЗНАЧИМОЕ значение S% (n ≥ порога).
+        # Строки, где не было бы ни одного значения (везде «нет посевов» /
+        # «нет теста»), из таблицы исключаются.
+        labels_ab = sorted(lbl for (a, lbl) in s_map if a == ab)
         if not labels_ab:
             continue
         matrix_rows.append([f"Антибиотик: {ab}"] + [''] * (len(clinics) + 2))
@@ -1770,38 +1795,29 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
                            ['Max−min', 'Разница (лучшая → худшая)'])
         for lbl in labels_ab:
             d = s_map[(ab, lbl)]
-            vals = [d.get(cl) for cl in clinics]
-            # в сравнение попадают только клиники с реальной статистикой
-            # (достаточно определений); «0%» из-за отсутствия тестирования
-            # не считается расхождением клиник
-            tested = [(cl, v) for cl, v in zip(clinics, vals)
-                      if v is not None and
-                      d_map.get((ab, lbl), {}).get(cl, 0) >= CMP_MIN_DEFINED]
-            nums = [v for _, v in tested]
+            tested = [(cl, pv[0], pv[1]) for cl in clinics
+                      if (pv := d.get(cl)) is not None]
+            nums = [v for _, v, _ in tested]
             spread = round(max(nums) - min(nums), 1) if len(nums) >= 2 else ''
             best_worst = ''
             if len(nums) >= 2 and spread != '':
                 mx, mn = max(nums), min(nums)
-                bcl = next(cl for cl, v in tested if v == mx)
-                wcl = next(cl for cl, v in tested if v == mn)
-                nb = d_map.get((ab, lbl), {}).get(bcl, 0)
-                nw = d_map.get((ab, lbl), {}).get(wcl, 0)
+                bcl, _, nb = next(t for t in tested if t[1] == mx)
+                wcl, _, nw = next(t for t in tested if t[1] == mn)
                 if mx > mn:
                     best_worst = (f"{bcl} (+{round(mx - mn, 1)} п.п., "
                                   f"n={nb}) vs {wcl} (n={nw})")
-                    # в топ-различия не берём случайные расхождения на малых n
-                    if min(nb, nw) >= MIN_N_LABEL:
-                        diff_rows.append((float(spread),
-                                          [ab, lbl, f"{mx:.1f}% (n={nb})", bcl,
-                                           f"{mn:.1f}% (n={nw})", wcl,
-                                           round(mx - mn, 1)]))
+                    diff_rows.append((float(spread),
+                                      [ab, lbl, f"{mx:.1f}% (n={nb})", bcl,
+                                       f"{mn:.1f}% (n={nw})", wcl,
+                                       round(mx - mn, 1)]))
                 else:
                     best_worst = "равно"
             elif len(tested) == 1:
-                best_worst = "сравнивать не с чем (тестировала одна клиника)"
+                best_worst = "значимые данные только у одной клиники"
             row_vals = []
-            for cl, v in zip(clinics, vals):
-                txt, status = _cell_status(ab, lbl, cl, v)
+            for cl in clinics:
+                txt, status = _cell_status(ab, lbl, cl)
                 row_vals.append(txt)
                 used_statuses.add(status)
             matrix_rows.append([lbl] + row_vals + [spread, best_worst])
@@ -1835,44 +1851,36 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         result[tab_name] = table_df
 
     # --- лист с графиками: S% по клиникам для одних и тех же наборов ---
-    # В графики попадают ТОЛЬКО значения, где клиника реально тестировала
-    # антибиотик (есть определения S/I/R). Пустые ячейки не рисуем — столбец
-    # просто отсутствует, а «0» не путается с «не тестировалось».
-    groups = []  # (ab, [labels], {clinic: [S% or None]}, used_labels)
+    # Простые сравнимые графики: ОДИН график на антибиотик, категории —
+    # микроорганизмы (материал вынесен в подпись), серии — клиники.
+    # В график попадают ТОЛЬКО значимые значения (n ≥ CMP_MIN_SIGNIFICANT):
+    # если у клиники по микроорганизму данных нет, столбец просто не рисуется
+    # (None), а не подставляется ложный «0%».
+    groups = []  # (ab, [orgs], {clinic: [S% or None]}, clinics_in_chart)
     by_ab = {}
-    for ab, cl, pairs in chart_data:
-        by_ab.setdefault(ab, []).append((cl, pairs))
+    for ab, cl, items in chart_data:
+        by_ab.setdefault(ab, []).append((cl, items))
     for ab in selected_abs:
         if ab not in by_ab:
             continue
-        # только «протестированные» значения: клиника + достаточно определений
         dmaps = {}
-        for cl, pairs in by_ab[ab]:
-            tested_pairs = [(lbl, sv) for lbl, sv in pairs
-                            if d_map.get((ab, lbl), {}).get(cl, 0) >= CMP_MIN_DEFINED]
-            if tested_pairs:
-                dmaps[cl] = dict(tested_pairs)
+        for cl, items in by_ab[ab]:
+            pairs = {lbl.split(' | ')[0]: sv for lbl, sv, nv in items}
+            if pairs:
+                dmaps[cl] = pairs
         cl_list = [cl for cl in clinics if cl in dmaps]
-        if not cl_list:
+        if len(cl_list) < 2:
+            continue   # сравнивать не с чем — график не строим
+        orgs = sorted({o for cl in cl_list for o in dmaps[cl]})
+        # приоритет: микроорганизмы, протестированные во всех клиниках
+        common = [o for o in orgs if all(o in dmaps[cl] for cl in cl_list)]
+        ordered = (common + [o for o in orgs if o not in set(common)])[:COMPARE_CHART_MAX_POINTS]
+        # убираем микроорганизмы без единого значения (не должны быть)
+        ordered = [o for o in ordered if any(o in dmaps[cl] for cl in cl_list)]
+        if not ordered:
             continue
-        labels = []
-        for cl in cl_list:
-            for lbl in dmaps[cl]:
-                if lbl not in labels:
-                    labels.append(lbl)
-        labels.sort()
-        # в график включаем только наборы «микроорганизм / материал», по которым
-        # есть данные хотя бы у одной клиники-участницы (dmaps уже содержит
-        # только реально протестированные значения); пустые столбцы не рисуем
-        labels = [l for l in labels if any(l in dmaps[cl] for cl in cl_list)]
-        if not labels:
-            continue
-        # приоритет: диапазоны, присутствующие во всех клиниках-участницах
-        common = [l for l in labels if all(l in dmaps[cl] for cl in cl_list)]
-        ordered = (common + [l for l in labels if l not in set(common)])[:COMPARE_CHART_MAX_POINTS]
-        series = {cl: [dmaps[cl].get(l) for l in ordered] for cl in cl_list}
-        if ordered:
-            groups.append((ab, ordered, series, cl_list))
+        series = {cl: [dmaps[cl].get(o) for o in ordered] for cl in cl_list}
+        groups.append((ab, ordered, series, cl_list))
     group_rows = []
     for ab, labels, series, cl_list in groups:
         group_rows.append([f"Антибиотик: {ab}"] + [''] * len(labels))
@@ -1888,8 +1896,9 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         chart_df = pd.DataFrame(group_rows)
     else:
         chart_df = pd.DataFrame([[
-            'Графики не построены: ни по одному набору «микроорганизм / материал» '
-            'нет данных с тестированием антибиотика хотя бы в одной клинике.']])
+            'Графики не построены: для сравнения нужны значимые данные '
+            f'(не менее {CMP_MIN_SIGNIFICANT} определений S/I/R) хотя бы по двум '
+            'клиникам на один и тот же микроорганизм.']])
 
     if log_func:
         log_func(f"Сравнение клиник «{spec.get('name')}»: {len(selected_abs)} антибиотик(ов), "
@@ -2360,7 +2369,7 @@ def _style_compare_matrix(ws, compare_meta=None):
                 if a in (None, '') or str(a).startswith('Антибиотик:'):
                     break
                 ws.cell(row=rr, column=1).alignment = left_al
-                num_cells = []   # [(col, value)] — числовые ячейки строки
+                parsed_cells = []  # [(col, S%)] — ячейки со значением строки
                 for c in clinic_cols:
                     cell = ws.cell(row=rr, column=c)
                     cell.border = border_all
@@ -2373,7 +2382,7 @@ def _style_compare_matrix(ws, compare_meta=None):
                             cell.fill = fill
                         if fnt:
                             cell.font = fnt
-                        num_cells.append((c, float(val)))
+                        parsed_cells.append((c, float(val)))
                     elif txt == 'нет теста':
                         # антибиотик не назначался этой паре в клинике
                         cell.fill = PatternFill(start_color='EDEDED',
@@ -2384,23 +2393,34 @@ def _style_compare_matrix(ws, compare_meta=None):
                         cell.fill = PatternFill(start_color='FFFFFF',
                                                 end_color='FFFFFF', fill_type='solid')
                         cell.font = Font(color='A6A6A6')
-                    elif '*' in txt:
-                        # «число* (n)» — мало определений, сравнивать осторожно
+                    else:
+                        # «S% (n=k)» — значение + число определений: заливаем
+                        # по тепловой шкале, подпись n печатаем серым
                         try:
-                            pct = float(txt.split('*')[0])
+                            pct = float(txt.split('%')[0])
                         except ValueError:
                             pct = None
                         if pct is not None:
+                            from openpyxl.cell.rich_text import CellRichText, TextBlock
+                            from openpyxl.cell.text import InlineFont
                             fill, fnt = _cmp_heat_style(pct)
                             if fill:
                                 cell.fill = fill
-                            if fnt:
-                                cell.font = Font(color=fnt.color, italic=True)
-                        num_cells.append((c, pct if pct is not None else -1.0))
+                            base_color = fnt.color.rgb if fnt else None
+                            main_ft = InlineFont(b=True, color=base_color)
+                            n_ft = InlineFont(color='FF7F7F7F', sz=9)
+                            try:
+                                head, _, tail = txt.partition('(')
+                                cell.value = CellRichText(
+                                    TextBlock(main_ft, head.strip()),
+                                    TextBlock(n_ft, '(' + tail))
+                            except Exception:
+                                cell.font = Font(bold=True, color=base_color or 'FF000000')
+                            parsed_cells.append((c, pct))
                 # жирная рамка вокруг лучшей/худшей клиники строки
-                if len(num_cells) >= 2:
-                    best_c = max(num_cells, key=lambda t: t[1])[0]
-                    worst_c = min(num_cells, key=lambda t: t[1])[0]
+                if len(parsed_cells) >= 2:
+                    best_c = max(parsed_cells, key=lambda t: t[1])[0]
+                    worst_c = min(parsed_cells, key=lambda t: t[1])[0]
                     if best_c != worst_c:
                         for cc in (best_c, worst_c):
                             cell = ws.cell(row=rr, column=cc)
