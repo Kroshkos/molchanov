@@ -809,6 +809,24 @@ COMPARE_CHART_MAX_BLOCKS = 8
 #: Максимальное число столбцов (диапазон АБ × микроорганизм) на графике
 COMPARE_CHART_MAX_POINTS = 60
 
+#: Диапазоны S% для цветовой шкалы в матрице сравнения клиник
+CMP_SCALES = [(80, 'C6EFCE', '006100'),   # высокая чувствительность — зелёный
+              (60, 'E2F0D9', '375623'),   # хорошая — светло-зелёный
+              (40, 'FFEB9C', '9C6500'),   # промежуточная — жёлтый
+              (20, 'FFCC99', '974706'),   # низкая — оранжевый
+              (0,  'FFC7CE', '9C0006')]   # критическая — красный
+#: Пороги, ниже которых показатель считается «плохим» / выше — «хорошим»
+CMP_BAD_T = 50.0
+CMP_GOOD_T = 80.0
+#: Максимум строк-«разниц» в сводке различий между клиниками
+CMP_MAX_DIFF_ROWS = 25
+#: Минимальное число посевов, при котором S% считается репрезентативным
+#: (меньше — значение помечается звёздочкой, в топ-различия не попадает)
+MIN_N_LABEL = 10
+#: Палитра серий клиник на графиках (шестнадцатеричные, без '#')
+CMP_SERIES_COLORS = ['4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5',
+                    '70AD47', '264478', '9E480E']
+
 #: Специальное значение в выборе антибиотика: «Все антибиотики» — суммарная
 #: антибиотикограмма по всем АБ-колонкам исходного файла сразу.
 AB_ALL_KEY = '__ALL__'
@@ -1442,9 +1460,21 @@ COMPARE_CLINICS_LABEL = '⚖️ Сравнение клиник'
 
 
 def get_compare_sheet_names(spec_name):
-    """Имена листов режима сравнения: таблица + лист с графиком."""
+    """Имена листов режима сравнения: таблица + матрица + графики."""
     base = sanitize_sheet_name(str(spec_name).strip())[:25] or 'Сравнение'
-    return base, sanitize_sheet_name(f'{base} (график)')
+    return (base,
+            sanitize_sheet_name(f'{base} (матрица)')[:31],
+            sanitize_sheet_name(f'{base} (графики)')[:31])
+
+
+def _cmp_heat_style(v):
+    """(заливка, шрифт) для значения S% по цветовой шкале CMP_SCALES."""
+    from openpyxl.styles import Font, PatternFill
+    for th, fg, fc in CMP_SCALES:
+        if v >= th:
+            return (PatternFill(start_color=fg, end_color=fg, fill_type='solid'),
+                    Font(color=fc))
+    return None, None
 
 
 def _clinic_codes(data):
@@ -1625,6 +1655,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
 
     blocks = []          # (ab, clinic, rows(list), total_row(list))
     chart_data = []      # (ab, clinic, [(label, S%)])
+    block_totals = {}    # (ab, clinic, label) -> число посевов (Total)
     for ab in selected_abs:
         idx = antibiotics.index(ab)
         col_i = ab_indices[idx]
@@ -1638,6 +1669,12 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
                 continue
             blocks.append((ab, cl, rows_out, total_row))
             chart_data.append((ab, cl, list(zip(labels_out, s_list))))
+            for lbl, row_vals in zip(labels_out, rows_out):
+                # Total — 5-й числовой столбец строки блока (после ключей)
+                try:
+                    block_totals[(ab, cl, lbl)] = int(row_vals[len(row_fields) + 4])
+                except (IndexError, TypeError, ValueError):
+                    block_totals[(ab, cl, lbl)] = 0
 
     if not blocks:
         raise ValueError("По выбранным антибиотикам и клиникам нет определений "
@@ -1665,6 +1702,102 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     while all_rows and all_rows[-1] == [''] * ncol:
         all_rows.pop()
     table_df = pd.DataFrame(all_rows)
+
+    tab_name, matrix_name, chart_name = get_compare_sheet_names(
+        spec.get('name', 'Сравнение клиник'))
+    result = {tab_name: table_df}
+
+    # --- лист «матрица»: один экран на весь набор сравнения ---
+    # Строки: Антибиотик × микроорганизм/материал; колонки: клиники (S%).
+    # Дополнительно: Max−min (разброс между клиниками) и «Разница» — самая
+    # сильная связка «клиника лучше / клиника хуже». Ячейки окрашиваются по
+    # цветовой шкале чувствительности (см. _style_compare_matrix).
+    s_map = {}          # (ab, label) -> {clinic: S%}
+    n_map = {}          # (ab, label) -> {clinic: Total посевов}
+    for ab, cl, rows_out, _tr in blocks:
+        pass  # totals уже собраны в block_totals
+    for ab, cl, pairs in chart_data:
+        for lbl, sv in pairs:
+            s_map.setdefault((ab, lbl), {})[cl] = sv
+    for (ab, cl, lbl), tot in block_totals.items():
+        n_map.setdefault((ab, lbl), {})[cl] = tot
+    matrix_rows = []
+    diff_rows = []      # (abs(d), row_values) — для сводки различий
+    for ab in selected_abs:
+        labels_ab = sorted({lbl for (a, lbl) in s_map if a == ab})
+        if not labels_ab:
+            continue
+        matrix_rows.append([f"Антибиотик: {ab}"] + [''] * (len(clinics) + 2))
+        matrix_rows.append(['Микроорганизм / материал'] + clinics +
+                           ['Max−min', 'Разница (лучшая → худшая)'])
+        for lbl in labels_ab:
+            d = s_map[(ab, lbl)]
+            vals = [d.get(cl) for cl in clinics]
+            # считаем разницу только там, где клиника реально тестировала
+            # антибиотик (есть значения S/I/R); чистые «0%» из-за отсутствия
+            # тестирования не считаются расхождением клиник
+            tested = [(cl, v) for cl, v in zip(clinics, vals)
+                      if v is not None and block_totals.get((ab, cl, lbl), 0) > 0]
+            nums = [v for _, v in tested]
+            spread = round(max(nums) - min(nums), 1) if len(nums) >= 2 else ''
+            best_worst = ''
+            if len(nums) >= 2 and spread != '':
+                mx, mn = max(nums), min(nums)
+                bcl = next(cl for cl, v in tested if v == mx)
+                wcl = next(cl for cl, v in tested if v == mn)
+                if mx > mn:
+                    nb = block_totals.get((ab, bcl, lbl), 0)
+                    nw = block_totals.get((ab, wcl, lbl), 0)
+                    best_worst = (f"{bcl} (+{round(mx - mn, 1)} п.п., "
+                                  f"n={nb}) vs {wcl} (n={nw})")
+                    # в топ-различия не берём случайные расхождения на 1-2 посевах
+                    if min(nb, nw) >= MIN_N_LABEL:
+                        diff_rows.append((float(spread),
+                                          [ab, lbl, f"{mx:.1f}% (n={nb})", bcl,
+                                           f"{mn:.1f}% (n={nw})", wcl,
+                                           round(mx - mn, 1)]))
+                else:
+                    best_worst = "равно"
+            elif len(tested) == 1:
+                best_worst = "тестировала только одна клиника"
+            nn = n_map.get((ab, lbl), {})
+            row_vals = []
+            for cl, v in zip(clinics, vals):
+                if v is None or nn.get(cl, 0) <= 0:
+                    row_vals.append('н/т')       # антибиотик не тестировался
+                elif nn.get(cl, 0) < MIN_N_LABEL:
+                    row_vals.append(f"{round(v, 1)}* ({nn[cl]})")
+                else:
+                    row_vals.append(round(v, 1))
+            matrix_rows.append([lbl] + row_vals + [spread, best_worst])
+        matrix_rows.append(['* — мало данных (n < %d), сравнивать осторожно; '
+                            '«н/т» — антибиотик не тестировался' % MIN_N_LABEL] +
+                           [''] * (len(clinics) + 2))
+        matrix_rows.append([''] * (len(clinics) + 3))
+    while matrix_rows and all(c in ('', None) for c in matrix_rows[-1]):
+        matrix_rows.pop()
+    matrix_df = pd.DataFrame(matrix_rows)
+    if len(matrix_rows) > 1:
+        result[matrix_name] = matrix_df
+
+    # --- сводка различий в конце табличного листа: топ расхождений ---
+    if diff_rows:
+        diff_rows.sort(key=lambda t: -t[0])
+        top = [r for _, r in diff_rows[:CMP_MAX_DIFF_ROWS]]
+        ncol = max(ncol, len(top[0]))
+        pad = lambda row: list(row) + [''] * (ncol - len(row))
+        sep = [''] * ncol
+        tail = [pad(['ТОП РАЗЛИЧИЙ МЕЖДУ КЛИНИКАМИ (по S%)']),
+                pad(['Антибиотик', 'Микроорганизм / материал',
+                     'Макс. S%', 'Клиника', 'Мин. S%', 'Клиника',
+                     'Разница, п.п.'])]
+        tail += [pad(r) for r in top]
+        tail += [sep]
+        while all_rows and all_rows[-1] == [''] * ncol:
+            all_rows.pop()
+        all_rows += tail
+        table_df = pd.DataFrame(all_rows)
+        result[tab_name] = table_df
 
     # --- лист с графиками: S% по клиникам для одних и тех же наборов ---
     groups = []  # (ab, [labels], {clinic: [S%]}, used_labels)
@@ -1699,15 +1832,13 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         group_rows.pop()
     chart_df = pd.DataFrame(group_rows) if group_rows else pd.DataFrame()
 
-    tab_name, chart_name = get_compare_sheet_names(spec.get('name', 'Сравнение клиник'))
-    result = {tab_name: table_df}
     if not chart_df.empty:
         result[chart_name] = chart_df
 
     if log_func:
         log_func(f"Сравнение клиник «{spec.get('name')}»: {len(selected_abs)} антибиотик(ов), "
                  f"{len(clinics)} клиник ({', '.join(clinics)}), "
-                 f"{len(blocks)} блоков, лист графика: «{chart_name}».")
+                 f"{len(blocks)} блоков; листы: «{tab_name}», «{matrix_name}», «{chart_name}».")
     return result
 
 
@@ -1809,7 +1940,7 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                   raw_data=data,
                   user_sheets=built_sheets, base_sheets=base_sheets,
                   chart_sheets={k: v for k, v in built_sheets.items()
-                                if '(график)' in k})
+                                if k.endswith('(графики)')})
 
     if log_func:
         log_func("Обработка успешно завершена!")
@@ -1891,7 +2022,7 @@ def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=N
                   log_func=log_func, styled=styled, raw_data=data,
                   user_sheets=built, base_sheets=False,
                   chart_sheets={k: v for k, v in built.items()
-                                if '(график)' in k})
+                                if k.endswith('(графики)')})
     if log_func:
         log_func(f"Сравнение клиник сохранено: {output_path}")
     return built
@@ -1975,10 +2106,13 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
             if not sheet4_df.empty:
                 sheet4_df.to_excel(writer, sheet_name='3', index=False, header=False)
 
-        # Листы конструктора
+        # Листы конструктора (табличные — с шапкой; листы графиков и
+        # матрицы сравнения пишутся «как есть», без pandas-шапки)
+        plain_sheets = set(chart_sheets) | {n for n in user_sheets
+                                            if n.endswith('(матрица)')}
         for name, df_sheet in user_sheets.items():
             df_sheet.to_excel(writer, sheet_name=name[:31], index=False,
-                              header=False if name in chart_sheets else True)
+                              header=False if name in plain_sheets else True)
 
         extra_sheets = list(user_sheets.keys())
         if styled:
@@ -2008,7 +2142,14 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                     adjusted_width = min(max_length + 2, 50)
                     worksheet.column_dimensions[column_letter].width = adjusted_width
 
-        # Графики сравнения клиников (листы «… (график)»)
+        # Оформление листа «матрица» сравнения клиник (тепловая шкала S%)
+        for name in chart_sheets:
+            matrix_nm = name[:-len('(графики)')] + '(матрица)' \
+                if name.endswith('(графики)') else None
+            if matrix_nm and matrix_nm in writer.sheets:
+                _style_compare_matrix(writer.sheets[matrix_nm])
+
+        # Графики сравнения клиник (листы «… (графики)»)
         for name in chart_sheets:
             if name in writer.sheets:
                 _add_comparison_charts(writer.sheets[name], log_func=log_func)
@@ -2076,15 +2217,140 @@ def _sheet_has_blocks(ws, max_scan_rows=5):
     return False
 
 
+def _style_header_row(ws, row_idx, ncols):
+    """Тёмно-синяя шапка строки таблицы (используется всеми стилями)."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    thin = Side(style="thin", color="B8C4D4")
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=row_idx, column=c)
+        cell.font = Font(bold=True, color="FFFFFF", size=11)
+        cell.fill = PatternFill("solid", fgColor="1F4E79")
+        cell.alignment = center
+        cell.border = border_all
+
+
+def _autofit_sheet(ws, max_width=50):
+    """Автоширина столбцов по содержимому."""
+    from openpyxl.utils import get_column_letter as gcl
+    widths = {}
+    for row in ws.iter_rows(values_only=False):
+        for cell in row:
+            if cell.value is not None:
+                l = len(str(cell.value))
+                widths[cell.column] = max(widths.get(cell.column, 0), l)
+    for col, length in widths.items():
+        ws.column_dimensions[gcl(col)].width = min(length + 2.5, max_width)
+
+
+def _style_compare_matrix(ws):
+    """Оформление листа «… (матрица)» сравнения клиник.
+
+    Тепловая цветовая шкала S% (чем выше чувствительность — тем зеленее),
+    подсветка Max−min (красный ≥20 п.п., зелёный ≤5 п.п.), шапки блоков,
+    автоширина и заморозка левого столбца с подписями строк.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    ACCENT = '1F4E79'
+    thin = Side(style='thin', color='B7C3D0')
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill(start_color=ACCENT, end_color=ACCENT, fill_type='solid')
+    sec_fill = PatternFill(start_color='DCE6F1', end_color='DCE6F1', fill_type='solid')
+    center = Alignment(horizontal='center', vertical='center')
+    left_al = Alignment(horizontal='left', vertical='center')
+
+    ncols = ws.max_column
+    r = 1
+    while r <= ws.max_row:
+        v = ws.cell(row=r, column=1).value
+        if v and str(v).startswith('Антибиотик:'):
+            ws.cell(row=r, column=1).font = Font(bold=True, color=ACCENT, size=12)
+            for c in range(1, ncols + 1):
+                ws.cell(row=r, column=c).fill = sec_fill
+            r += 1
+            continue
+        if v == 'Микроорганизм / материал':
+            _style_header_row(ws, r, ncols)
+            hdr = [ws.cell(row=r, column=c).value for c in range(1, ncols + 1)]
+            clinic_cols = [c for c in range(2, ncols + 1)
+                           if hdr[c - 1] not in ('Max−min',) and
+                           not str(hdr[c - 1] or '').startswith('Разница')]
+            spread_col = next((c for c in range(2, ncols + 1)
+                               if hdr[c - 1] == 'Max−min'), None)
+            rr = r + 1
+            while rr <= ws.max_row:
+                a = ws.cell(row=rr, column=1).value
+                if a in (None, '') or str(a).startswith('Антибиотик:'):
+                    break
+                ws.cell(row=rr, column=1).alignment = left_al
+                best_c, worst_c, best_v = None, None, None
+                for c in clinic_cols:
+                    cell = ws.cell(row=rr, column=c)
+                    cell.border = border_all
+                    cell.alignment = center
+                    val = cell.value
+                    if isinstance(val, (int, float)):
+                        fill, fnt = _cmp_heat_style(float(val))
+                        if fill:
+                            cell.fill = fill
+                        if fnt:
+                            cell.font = fnt
+                        if best_v is None or val > best_v:
+                            best_v, best_c = val, c
+                        if worst_c is None or val < ws.cell(row=rr, column=worst_c).value:
+                            worst_c = c
+                # жирная рамка вокруг лучшей/худшей клиники строки
+                for cc in (best_c, worst_c):
+                    if cc:
+                        cell = ws.cell(row=rr, column=cc)
+                        cell.border = Border(left=Side(style='medium', color='404040'),
+                                             right=Side(style='medium', color='404040'),
+                                             top=Side(style='medium', color='404040'),
+                                             bottom=Side(style='medium', color='404040'))
+                if spread_col:
+                    sc = ws.cell(row=rr, column=spread_col)
+                    sc.border = border_all
+                    sc.alignment = center
+                    if isinstance(sc.value, (int, float)):
+                        d = float(sc.value)
+                        if d >= 20:
+                            sc.fill = PatternFill(start_color='FFC7CE',
+                                                  end_color='FFC7CE', fill_type='solid')
+                            sc.font = Font(color='9C0006', bold=True)
+                        elif d <= 5:
+                            sc.fill = PatternFill(start_color='C6EFCE',
+                                                  end_color='C6EFCE', fill_type='solid')
+                            sc.font = Font(color='006100')
+                for c in range(spread_col + 1 if spread_col else ncols, ncols + 1):
+                    ws.cell(row=rr, column=c).border = border_all
+                    ws.cell(row=rr, column=c).alignment = left_al
+                rr += 1
+            r = rr
+            continue
+        r += 1
+
+    _autofit_sheet(ws)
+    ws.freeze_panes = 'B1'
+
+
 def _add_comparison_charts(ws, log_func=None):
-    """Добавляет столбчатые диаграммы на лист графика сравнения клиник.
+    """Добавляет столбчатые диаграммы на лист «… (графики)» сравнения клиник.
 
     Структура листа (см. build_clinic_comparison): блок из трёх строк —
     заголовок антибиотика, строка «Клиника | <диапазоны…>», затем по строке
     на клинику со значениями S%. На каждый блок создаётся своя диаграмма
-    BarChart с осями категорий (микроорганизм/материал) и сериями-клиниками.
+    BarChart: оси категорий (микроорганизм/материал), серии-клиники в
+    единой цветовой палитре, лимит оси 0–100%, подписи значений над
+    столбцами, легенда справа. Диаграммы размещаются сеткой 2 в ряд, чтобы
+    лист был компактным и сопоставимым между антибиотиками.
     """
     from openpyxl.chart import BarChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.drawing.line import LineProperties
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.chart.series import SeriesLabel
 
     n_charts = 0
     r = 1
@@ -2106,29 +2372,47 @@ def _add_comparison_charts(ws, log_func=None):
                 chart = BarChart()
                 chart.type = "col"
                 chart.grouping = "clustered"
+                chart.gapWidth = 60
+                chart.overlap = -10
                 chart.title = str(a)
                 chart.y_axis.title = 'Чувствительность, %'
                 chart.x_axis.title = 'Микроорганизм / материал'
+                chart.y_axis.scaling.min = 0
+                chart.y_axis.scaling.max = 100
+                chart.y_axis.majorGridlines = None
                 data = Reference(ws, min_col=2, max_col=ncols,
                                  min_row=header_row, max_row=last_data)
                 cats = Reference(ws, min_col=2, max_col=ncols,
                                  min_row=header_row, max_row=header_row)
                 chart.add_data(data, titles_from_data=False, from_rows=True)
                 chart.set_categories(cats)
-                # имена серий — из первого столбца блока
+                # имена серий — из первого столбца блока; фиксированные
+                # цвета клиник (одинаковые во всех графиках набора)
                 series_names = []
                 for sr in range(header_row + 1, last_data + 1):
                     v = ws.cell(row=sr, column=1).value
                     series_names.append(str(v) if v not in (None, '') else f"Ряд {len(series_names)+1}")
-                for s, nm in zip(chart.series, series_names):
-                    from openpyxl.chart.series import SeriesLabel
-                    from openpyxl.chart.data_source import StrRef
+                for i, (s, nm) in enumerate(zip(chart.series, series_names)):
                     s.tx = SeriesLabel(v=nm)
-                chart.width = 32
-                chart.height = 12
-                anchor_col = 1
-                anchor_row = last_data + 2 + n_charts * 1
-                ws.add_chart(chart, f"{get_column_letter(anchor_col)}{anchor_row}")
+                    color = CMP_SERIES_COLORS[i % len(CMP_SERIES_COLORS)]
+                    gp = GraphicalProperties()
+                    gp.solidFill = color
+                    gp.noFill = False
+                    gp.line = LineProperties(solidFill='FFFFFF', w=9525)
+                    s.graphicalProperties = gp
+                try:
+                    chart.dataLabels = DataLabelList()
+                    chart.dataLabels.showVal = True
+                    chart.dataLabels.numFmt = '0'
+                except Exception:
+                    pass
+                chart.width = 24
+                chart.height = 11
+                # сетка размещения: 2 диаграммы в ряд, ниже блоков данных
+                grid_row = n_charts // 2
+                grid_col = 1 if n_charts % 2 == 0 else 13
+                anchor_row = last_data + 3 + grid_row * 23
+                ws.add_chart(chart, f"{get_column_letter(grid_col)}{anchor_row}")
                 n_charts += 1
                 if n_charts >= COMPARE_CHART_MAX_BLOCKS:
                     break
@@ -2280,14 +2564,25 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets,
             if val and str(val).startswith('Антибиотик:'):
                 ws.cell(row=r, column=1).font = Font(bold=True, color=ACCENT, size=12)
                 ws.cell(row=r, column=1).fill = section_fill
-                if r + 1 <= max_row:
-                    style_header_row(ws, r + 1, ncols)
-                rr = r + 2
+                rr = r + 1
+                # подзаголовок клиники (есть только в листах сравнения)
+                v2 = ws.cell(row=rr, column=1).value
+                if v2 and str(v2).startswith('Клиника:'):
+                    ws.cell(row=rr, column=1).font = Font(bold=True, color='2E5F8A')
+                    for c in range(1, ncols + 1):
+                        ws.cell(row=rr, column=c).fill = section_fill
+                    style_header_row(ws, rr + 1, ncols)
+                    rr += 2
+                else:
+                    style_header_row(ws, rr, ncols)
+                    rr += 1
                 k = 0
                 s_col = None
+                hdr_scan = rr - 1
                 while rr <= max_row:
                     v = ws.cell(row=rr, column=1).value
-                    if v in (None, '') or str(v).startswith('Антибиотик:'):
+                    if v in (None, '') or str(v).startswith(('Антибиотик:', 'Клиника:',
+                                                             'ТОП РАЗЛИЧИЙ')):
                         break
                     for c in range(1, ncols + 1):
                         cell = ws.cell(row=rr, column=c)
@@ -2296,19 +2591,39 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets,
                             cell.fill = zebra_fill
                     if s_col is None:
                         for c in range(1, ncols + 1):
-                            if ws.cell(row=r + 1, column=c).value == 'S%':
+                            if ws.cell(row=hdr_scan, column=c).value == 'S%':
                                 s_col = c
                                 break
                     k += 1
                     rr += 1
-                if s_col:
-                    rng = f"{gcl(s_col)}{r + 2}:{gcl(s_col)}{r + 1 + k}"
+                if s_col and k:
+                    rng = f"{gcl(s_col)}{hdr_scan + 1}:{gcl(s_col)}{hdr_scan + k}"
                     ws.conditional_formatting.add(rng, CellIsRule(
                         operator='greaterThanOrEqual', formula=['80'],
                         fill=PatternFill(start_color=GOOD, end_color=GOOD, fill_type='solid')))
                     ws.conditional_formatting.add(rng, CellIsRule(
                         operator='lessThan', formula=['50'],
                         fill=PatternFill(start_color=BAD, end_color=BAD, fill_type='solid')))
+                r = rr
+            elif val and str(val).startswith('ТОП РАЗЛИЧИЙ'):
+                # сводка расхождений между клиниками в конце листа сравнения
+                ws.cell(row=r, column=1).font = Font(bold=True, color=ACCENT, size=12)
+                ws.cell(row=r, column=1).fill = section_fill
+                if r + 1 <= max_row:
+                    style_header_row(ws, r + 1, ncols)
+                rr = r + 2
+                k = 0
+                while rr <= max_row:
+                    v = ws.cell(row=rr, column=1).value
+                    if v in (None, ''):
+                        break
+                    for c in range(1, ncols + 1):
+                        cell = ws.cell(row=rr, column=c)
+                        cell.border = border_all
+                        if k % 2 == 1:
+                            cell.fill = zebra_fill
+                    k += 1
+                    rr += 1
                 r = rr
             else:
                 r += 1
