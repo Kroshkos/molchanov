@@ -1353,13 +1353,13 @@ def validate_spec(spec, available_antibiotics=None):
         errors.append("Название листа не должно превышать 31 символ.")
     is_compare = spec.get('mode') == COMPARE_CLINICS_KEY
     if is_compare:
-        # отдельный режим «Сравнение клиник»: список антибиотиков + клиники
-        abs_list = [a for a in (spec.get('antibiotics') or
-                                ([spec['antibiotic']] if spec.get('antibiotic') else []))
-                    if a and a != AB_ALL_KEY]
-        if not abs_list:
-            errors.append("Для сравнения клиников выберите хотя бы один антибиотик "
-                          "(пустой список = все антибиотики файла).")
+        # отдельный режим «Сравнение клиник»: список антибиотиков + клиники.
+        # Пустой список антибиотиков допустим — трактывается как
+        # «все антибиотики файла» (AB_ALL_KEY).
+        raw_abs = spec.get('antibiotics')
+        if raw_abs is None:
+            raw_abs = [spec['antibiotic']] if spec.get('antibiotic') else []
+        abs_list = [a for a in raw_abs if a and a != AB_ALL_KEY]
         if available_antibiotics is not None:
             missing = [a for a in abs_list if a not in available_antibiotics]
             if missing:
@@ -1478,7 +1478,7 @@ def count_rows_by_clinic(data):
     return counts
 
 
-def _cmp_block_stats(sub, data, col_lab, row_fields, combos):
+def _cmp_block_stats(sub, data, col_i, row_fields, combos):
     """Считает строки блока (клиника × антибиотик) в формате листа 3.
 
     Возвращает (rows_out, total_row, s_list, labels_out):
@@ -1495,8 +1495,11 @@ def _cmp_block_stats(sub, data, col_lab, row_fields, combos):
             return s if s in AB_METRICS else 'НД'
         return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
 
-    if col_lab is not None and col_lab in data.columns:
-        rsi_src = data.loc[sub.index, col_lab]
+    # Колонку берём по позиции: в исходных файлах заголовки «RSI»/«MIC»
+    # повторяются, выбор по метке вернул бы не ту колонку (или Series из
+    # нескольких колонок сразу).
+    if col_i is not None and 0 <= col_i < data.shape[1]:
+        rsi_src = data.iloc[:, col_i].reindex(sub.index)
     else:
         rsi_src = pd.Series(index=sub.index, dtype=object)
     tmp = pd.DataFrame({'_rsi': rsi_src.apply(_rsi)})
@@ -1505,9 +1508,15 @@ def _cmp_block_stats(sub, data, col_lab, row_fields, combos):
             # берём значения по индексам (а не .values): pos может быть вырезан
             # из base_df, индексы строк которого не совпадают с data
             tmp[f] = sub[f].reindex(tmp.index).fillna('').astype(str).str.strip().values
-        counts = tmp.groupby(row_fields + ['_rsi']).size().unstack('_rsi', fill_value=0)
+        counts = tmp.groupby(row_fields + ['_rsi'], observed=True).size().unstack('_rsi', fill_value=0)
         if isinstance(counts.index, pd.MultiIndex):
+            # 2+ полевые группы: сбрасываем MultiIndex в колонки
             counts = counts.reset_index()
+        else:
+            # одна полевая группа: unstack возвращает обычный индекс со
+            # скалярными метками (не кортежами) — превращаем в колонку
+            counts.insert(0, row_fields[0], list(counts.index))
+            counts.index = pd.RangeIndex(len(counts))
         counts = counts.reset_index(drop=True)
     else:
         vc = tmp['_rsi'].value_counts()
@@ -1614,23 +1623,17 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     else:
         combos = [('Все данные',)]
 
-    # индексы колонок данных: position -> column label
-    col_labels_map = {}
-    for i, c in enumerate(data.columns):
-        col_labels_map[i] = c
-
     blocks = []          # (ab, clinic, rows(list), total_row(list))
     chart_data = []      # (ab, clinic, [(label, S%)])
     for ab in selected_abs:
         idx = antibiotics.index(ab)
         col_i = ab_indices[idx]
-        col_lab = col_labels_map.get(col_i)
         for cl in clinics:
             sub = pos[pos['clinic'].astype(str).str.strip() == cl] if 'clinic' in pos.columns else pos
             if sub.empty:
                 continue
             rows_out, total_row, s_list, labels_out = _cmp_block_stats(
-                sub, data, col_lab, row_fields, combos)
+                sub, data, col_i, row_fields, combos)
             if not rows_out:
                 continue
             blocks.append((ab, cl, rows_out, total_row))
