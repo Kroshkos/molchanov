@@ -34,14 +34,89 @@ MODE_NORMAL_LABEL = "Обычный лист (группировка и метр
 MODE_COMPARE_LABEL = "⚖️ Сравнение клиник (АБГ по разным клиникам)"
 
 
+class MultiSelectFrame(ctk.CTkFrame):
+    """Поиск + многосписочный выбор значений (антибиотики для сравнения)."""
+
+    def __init__(self, master, values=None, height=140, on_change=None):
+        super().__init__(master, fg_color="transparent")
+        self._all = list(values or [])
+        self.on_change = on_change
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 4))
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refilter())
+        ctk.CTkEntry(top, textvariable=self.search_var, height=28,
+                     placeholder_text="Поиск по названию…").pack(side="left", fill="x", expand=True)
+        btns = ctk.CTkFrame(top, fg_color="transparent")
+        btns.pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btns, text="Все", width=52, height=26,
+                      fg_color="transparent", border_width=1,
+                      command=self.select_all).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btns, text="Снять", width=52, height=26,
+                      fg_color="transparent", border_width=1,
+                      command=self.clear_selection).pack(side="left")
+        self.listbox = tk.Listbox(self, selectmode="extended", height=6,
+                                  exportselection=False, activestyle="none",
+                                  font=("Segoe UI", 11),
+                                  bg=("#ebeef3" if ctk.get_appearance_mode() == "Light" else "#2b2b2b"),
+                                  fgcolor=("#111318" if ctk.get_appearance_mode() == "Light" else "#e5e5e5"),
+                                  selectbackground="#3B82F6", selectforeground="white",
+                                  highlightthickness=0, relief="flat")
+        self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<<ListboxSelect>>", lambda e: self._notify())
+        self.set_values(self._all)
+
+    def set_values(self, values):
+        self._all = list(values)
+        self._refilter()
+
+    def _refilter(self):
+        q = self.search_var.get().strip().lower()
+        shown = [v for v in self._all if not q or q in str(v).lower()]
+        sel = set(self.get_selected())
+        keep_first = bool(q) and not sel  # при поиске выделяем первые совпадения
+        self.listbox.delete(0, "end")
+        for i, v in enumerate(shown):
+            self.listbox.insert("end", v)
+            if v in sel or (keep_first and i < 5):
+                self.listbox.selection_set(i)
+
+    def get_selected(self):
+        return [self.listbox.get(i) for i in self.listbox.curselection()]
+
+    def select_all(self):
+        self.listbox.selection_set(0, "end")
+        self._notify()
+
+    def clear_selection(self):
+        self.listbox.selection_clear(0, "end")
+        self._notify()
+
+    def set_selected(self, items):
+        wanted = {str(i) for i in (items or [])}
+        self.listbox.selection_clear(0, "end")
+        for i in range(self.listbox.size()):
+            if self.listbox.get(i) in wanted:
+                self.listbox.selection_set(i)
+
+    def _notify(self):
+        if self.on_change:
+            try:
+                self.on_change()
+            except Exception:
+                pass
+
+
 class SheetCard(ctk.CTkFrame):
     """Карточка одного листа конструктора."""
 
-    def __init__(self, master, index, spec=None, antibiotics_getter=None, on_delete=None):
+    def __init__(self, master, index, spec=None, antibiotics_getter=None,
+                 clinics_getter=None, on_delete=None):
         super().__init__(master, fg_color=("gray84", "gray22"), corner_radius=10)
         self.index = index
         self.on_delete = on_delete
         self._antibiotics_getter = antibiotics_getter or (lambda: [])
+        self._clinics_getter = clinics_getter or (lambda: [])
         self._suppress_cb_logic = False  # защита от рекурсии при программной установке
 
         spec = spec or {}
@@ -134,6 +209,35 @@ class SheetCard(ctk.CTkFrame):
             row4, values=[label for _, label in FILTER_OPTIONS])
         self.filter_menu.grid(row=0, column=3, sticky="ew")
 
+        # --- дополнительные поля режима «Сравнение клиник» ---
+        # Несколько антибиотиков для сравнения (пустой список = все из файла)
+        cmp_ab_frame = ctk.CTkFrame(body, fg_color="transparent")
+        cmp_ab_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        cmp_ab_frame.columnconfigure(1, weight=1)
+        self.cmp_ab_title = ctk.CTkLabel(cmp_ab_frame,
+                                         text="Антибиотики для сравнения\n(можно несколько):",
+                                         font=ctk.CTkFont(size=12), justify="left")
+        self.cmp_ab_title.grid(row=0, column=0, sticky="nw", padx=(0, 6))
+        self.cmp_ab_listbox = tk.Listbox(cmp_ab_frame, selectmode="extended",
+                                         height=5, exportselection=False,
+                                         activestyle="none", font=("Segoe UI", 11))
+        self.cmp_ab_listbox.grid(row=0, column=1, sticky="ew")
+        self.cmp_ab_hint = ctk.CTkLabel(cmp_ab_frame, text="",
+                                       font=ctk.CTkFont(size=11),
+                                       text_color=("gray45", "gray65"))
+        self.cmp_ab_hint.grid(row=1, column=1, sticky="w", pady=(2, 0))
+        self._cmp_abs = []
+        self.cmp_ab_listbox.bind("<<ListboxSelect>>", lambda *_: self._update_cmp_ab_hint())
+
+        # Клиники для сравнения (чекбоксы из исходного файла)
+        self.cmp_clinic_label = ctk.CTkLabel(body,
+                                             text="Клиники для сравнения\n(отметьте ≥ 2):",
+                                             font=ctk.CTkFont(size=12), justify="left")
+        self.cmp_clinic_frame = ctk.CTkFrame(body, fg_color="transparent")
+        self.cmp_clinic_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._clinic_vars = {}      # код клиники -> BooleanVar
+        self._clinic_checkboxes = {}  # код клиники -> CTkCheckBox
+
         # восстановление выбранных антибиотика/фильтра
         if spec.get("antibiotic"):
             ab_val = spec["antibiotic"]
@@ -146,10 +250,14 @@ class SheetCard(ctk.CTkFrame):
                     self.filter_menu.set(label)
                     break
         self._refresh_antibiotics()
+        self.set_clinics(spec.get("clinics") or [])
+        if spec.get("antibiotics"):
+            self._set_cmp_selected(spec["antibiotics"])
         # В Tk режим трассировки называется "write" (а не "changed") — иначе
         # создание карточки падало с TclError и кнопка «Добавить лист» не работала.
         self.ab_var.trace_add("write", lambda *_: self._refresh_antibiotics())
         self._apply_mode_layout()
+        self._update_cmp_ab_hint()
 
     # ------------------------------------------------------------------
     def _is_compare(self):
@@ -173,6 +281,19 @@ class SheetCard(ctk.CTkFrame):
                       else "Группировать по:\n(можно выбирать несколько)"))
             self.ab_title.configure(
                 text="Антибиотик для сравнения:" if compare else "Антибиотик:")
+            # поля режима сравнения: список антибиотиков + чекбоксы клиник
+            if compare:
+                self.cmp_ab_title.grid()
+                self.cmp_ab_listbox.grid()
+                self.cmp_ab_hint.grid()
+                self.cmp_clinic_label.grid()
+                self.cmp_clinic_frame.grid()
+            else:
+                self.cmp_ab_title.grid_remove()
+                self.cmp_ab_listbox.grid_remove()
+                self.cmp_ab_hint.grid_remove()
+                self.cmp_clinic_label.grid_remove()
+                self.cmp_clinic_frame.grid_remove()
             if compare:
                 self.met_label.grid_remove()
                 self.ab_cb.grid_remove()
@@ -187,6 +308,96 @@ class SheetCard(ctk.CTkFrame):
                 self.ab_cb.grid()
                 for w in self.met_frame.winfo_children():
                     w.grid()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Поля режима «Сравнение клиник»
+    # ------------------------------------------------------------------
+    def set_clinics(self, clinics, checked=None):
+        """Перестраивает чекбоксы клиник (список кодов из исходного файла).
+
+        checked — какие клиники отмечены (по умолчанию все, если ранее
+        выбор уже был сделан карточкой — сохраняем пересечение).
+        """
+        clinics = list(clinics or [])
+        prev_checked = {k for k, v in self._clinic_vars.items() if v.get()}
+        for cb in self._clinic_checkboxes.values():
+            try:
+                cb.destroy()
+            except Exception:
+                pass
+        self._clinic_checkboxes.clear()
+        self._clinic_vars.clear()
+        if checked is None:
+            checked_set = set(clinics) if not prev_checked else (prev_checked & set(clinics)) \
+                or set(clinics)
+        else:
+            checked_set = set(checked)
+        for i, cl in enumerate(clinics):
+            var = ctk.BooleanVar(value=cl in checked_set)
+            cb = ctk.CTkCheckBox(self.cmp_clinic_frame, text=str(cl), variable=var,
+                                 font=ctk.CTkFont(size=12))
+            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 18), pady=2)
+            self._clinic_vars[cl] = var
+            self._clinic_checkboxes[cl] = cb
+        if not clinics:
+            hint = ctk.CTkLabel(self.cmp_clinic_frame,
+                                text="Клиники не определены — выберите исходный файл "
+                                     "и обновите список.",
+                                font=ctk.CTkFont(size=11),
+                                text_color=("#B45309", "#F59E0B"))
+            hint.grid(row=0, column=0, sticky="w")
+            self._clinic_checkboxes["__hint__"] = hint
+
+    def selected_clinics(self):
+        return [k for k, v in self._clinic_vars.items() if v.get()]
+
+    def refresh_antibiotics_multilist(self):
+        """Обновляет список антибиотиков для многократного выбора."""
+        try:
+            abs_list = [a for a in self._antibiotics_getter() if a and a != AB_ALL_KEY]
+        except Exception:
+            abs_list = []
+        sel = self._get_cmp_selected()
+        self._cmp_abs = abs_list
+        lb = self.cmp_ab_listbox
+        lb.delete(0, "end")
+        for a in abs_list:
+            lb.insert("end", a)
+        wanted = {s for s in sel if s in set(abs_list)}
+        if wanted:
+            for i, a in enumerate(abs_list):
+                if a in wanted:
+                    lb.selection_set(i)
+        self._update_cmp_ab_hint()
+
+    def _get_cmp_selected(self):
+        try:
+            return [self.cmp_ab_listbox.get(i) for i in self.cmp_ab_listbox.curselection()]
+        except Exception:
+            return []
+
+    def _set_cmp_selected(self, items):
+        wanted = set(items or [])
+        lb = self.cmp_ab_listbox
+        lb.selection_clear(0, "end")
+        for i in range(lb.size()):
+            if lb.get(i) in wanted:
+                lb.selection_set(i)
+        self._update_cmp_ab_hint()
+
+    def _update_cmp_ab_hint(self):
+        n_sel = len(self._get_cmp_selected())
+        n_all = len(self._cmp_abs)
+        if n_sel:
+            text = f"Выбрано антибиотиков для сравнения: {n_sel} из {n_all}."
+        elif n_all:
+            text = f"Ничего не отмечено — будут сравниваться ВСЕ антибиотики файла ({n_all})."
+        else:
+            text = "Список антибиотиков пуст — выберите исходный файл и обновите список."
+        try:
+            self.cmp_ab_hint.configure(text=text)
         except Exception:
             pass
 
@@ -242,6 +453,7 @@ class SheetCard(ctk.CTkFrame):
         антибиотика ведёт словарь self._ab_key (ранее использовался хак со
         скрытыми символами в значении, который ломал карточку при открытии).
         """
+        self.refresh_antibiotics_multilist()  # синхронизируем мультивыбор сравнения
         try:
             abs_list = list(self._antibiotics_getter())
         except Exception:
@@ -319,6 +531,10 @@ class SheetCard(ctk.CTkFrame):
                 # могли храниться как текстовая метка, а не служебный ключ
                 self._pending_ab = AB_ALL_KEY if ab_val == AB_ALL_LABEL else ab_val
                 self._refresh_antibiotics()
+            if compare and spec.get("antibiotics"):
+                self._set_cmp_selected(spec["antibiotics"])
+            if "clinics" in spec:
+                self.set_clinics(self._clinics_getter(), checked=spec.get("clinics"))
             fkey = spec.get("filter", "none")
             for key, label in FILTER_OPTIONS:
                 if key == fkey:
@@ -347,6 +563,8 @@ class SheetCard(ctk.CTkFrame):
                 "compare_by": groups,
                 "metrics": ["ab"],
                 "antibiotic": self._selected_antibiotic(),
+                "antibiotics": self._get_cmp_selected(),
+                "clinics": self.selected_clinics(),
                 "filter": filter_key,
                 "mode": COMPARE_CLINICS_KEY,
             }
@@ -362,7 +580,7 @@ class SheetCard(ctk.CTkFrame):
 class SheetBuilderDialog(ctk.CTkToplevel):
     """Модальное окно конструктора дополнительных листов."""
 
-    def __init__(self, master, antibiotics_getter=None):
+    def __init__(self, master, antibiotics_getter=None, clinics_getter=None):
         super().__init__(master)
         self.title("🧩 Конструктор листов отчёта")
         self.geometry("1100x680")
@@ -372,6 +590,7 @@ class SheetBuilderDialog(ctk.CTkToplevel):
 
         self.specs = []
         self._antibiotics_getter = antibiotics_getter or (lambda: [])
+        self._clinics_getter = clinics_getter or (lambda: [])
         self._cards = []
 
         # Шапка
@@ -439,6 +658,7 @@ class SheetBuilderDialog(ctk.CTkToplevel):
         try:
             card = SheetCard(self.scroll, len(self._cards), spec=spec,
                              antibiotics_getter=self._antibiotics_getter,
+                             clinics_getter=self._clinics_getter,
                              on_delete=self._remove_card)
             card.pack(fill="x", pady=6)
             self._cards.append(card)
@@ -447,11 +667,18 @@ class SheetBuilderDialog(ctk.CTkToplevel):
                                  parent=self)
 
     def _refresh_all_antibiotics(self):
-        """Обновляет список антибиотиков во всех карточках."""
+        """Обновляет список антибиотиков (и клиник) во всех карточках."""
         n = 0
+        clinics = []
+        try:
+            clinics = list(self._clinics_getter())
+        except Exception:
+            pass
         for c in self._cards:
             try:
                 c._refresh_antibiotics()
+                if clinics:
+                    c.set_clinics(clinics)
                 n += 1
             except Exception:
                 pass

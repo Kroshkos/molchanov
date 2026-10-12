@@ -6,7 +6,11 @@ from datetime import datetime
 import customtkinter as ctk
 from tkinter import filedialog
 
-from app_core import run_pipeline, load_data
+from app_core import (
+    run_pipeline, run_pipeline_multi_clinic, run_clinic_comparison, load_data,
+    get_file_info, detect_clinics, ALL_CLINICS_LABEL, COMPARE_CLINICS_LABEL,
+    COMPARE_CLINICS_KEY, validate_spec, save_compare_preset, load_compare_preset,
+)
 from sheet_builder import SheetBuilderDialog
 
 ctk.set_appearance_mode("dark")          # "dark", "light" или "system"
@@ -20,8 +24,8 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("🧬  Обработка микробиологических данных")
-        self.geometry("980x680")
-        self.minsize(860, 600)
+        self.geometry("980x760")
+        self.minsize(860, 640)
 
         self.input_file = ctk.StringVar()
         self.output_file = ctk.StringVar()
@@ -32,6 +36,11 @@ class App(ctk.CTk):
         # Конструктор дополнительных листов
         self._sheet_specs = []          # спецификации из конструктора
         self._antibiotics_cache = []    # антибиотики последнего загруженного файла
+        # Клиники последнего загруженного файла
+        self._clinics_cache = []        # список клиник (без спецпунктов)
+        self._clinic_vars = {}          # код клиники -> BooleanVar (режим сравнения)
+        self._clinic_checkboxes = {}    # код клиники -> CTkCheckBox
+        self._scan_token = 0            # отмена устаревших фоновых сканов файла
 
         self._build_ui()
         self.after(100, self._poll_log_queue)
@@ -90,6 +99,105 @@ class App(ctk.CTk):
         self.output_entry.grid(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 8))
         ctk.CTkButton(inner, text="Сохранить как…", width=110, command=self.select_output
                       ).grid(row=3, column=2, sticky="e")
+
+        # ---------- Клиника: выбор режима обработки ----------
+        clinic_card = ctk.CTkFrame(body)
+        clinic_card.pack(fill="x", pady=(0, 10))
+
+        cinner = ctk.CTkFrame(clinic_card, fg_color="transparent")
+        cinner.pack(fill="x", padx=16, pady=14)
+        cinner.columnconfigure(0, weight=1)
+
+        top_row = ctk.CTkFrame(cinner, fg_color="transparent")
+        top_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        top_row.columnconfigure(1, weight=1)
+        ctk.CTkLabel(top_row, text="Клиника:",
+                     font=ctk.CTkFont(size=13, weight="bold")).grid(row=0, column=0,
+                                                                    sticky="w", padx=(0, 8))
+        self.clinic_menu = ctk.CTkOptionMenu(
+            top_row, values=[ALL_CLINICS_LABEL], width=260,
+            command=self._on_clinic_mode_changed)
+        self.clinic_menu.grid(row=0, column=1, sticky="w")
+        self.clinic_menu.set(ALL_CLINICS_LABEL)
+
+        # Панель отдельного режима «Сравнение клиник» (видна только в нём)
+        self.compare_frame = ctk.CTkFrame(cinner, fg_color="transparent")
+        self.compare_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.compare_frame.grid_remove()
+
+        cf_inner = ctk.CTkFrame(self.compare_frame, fg_color="transparent")
+        cf_inner.pack(fill="x")
+        cf_inner.columnconfigure(1, weight=1)
+
+        self.cmp_title_label = ctk.CTkLabel(cf_inner, text="Антибиотики для сравнения\n(ничего не отмечено = все):",
+                                            font=ctk.CTkFont(size=12), justify="left")
+        self.cmp_title_label.grid(row=0, column=0, sticky="nw", padx=(0, 8))
+        self.cmp_ab_frame = ctk.CTkFrame(cf_inner, fg_color="transparent")
+        self.cmp_ab_frame.grid(row=0, column=1, sticky="ew")
+        self.cmp_ab_frame.columnconfigure(0, weight=1)
+
+        cmp_list_row = ctk.CTkFrame(self.cmp_ab_frame, fg_color="transparent")
+        cmp_list_row.grid(row=0, column=0, sticky="ew")
+        cmp_list_row.columnconfigure(0, weight=1)
+        self.cmp_search_var = ctk.StringVar()
+        self.cmp_search_var.trace_add("write", lambda *_: self._refilter_cmp_antibiotics())
+        ctk.CTkEntry(cmp_list_row, textvariable=self.cmp_search_var, height=28,
+                     placeholder_text="Поиск антибиотика по названию…").grid(
+            row=0, column=0, sticky="ew", padx=(0, 6))
+        cmp_btns = ctk.CTkFrame(cmp_list_row, fg_color="transparent")
+        cmp_btns.grid(row=0, column=1)
+        ctk.CTkButton(cmp_btns, text="Выбрать все", width=92, height=26,
+                      fg_color="transparent", border_width=1,
+                      command=self._cmp_select_all_abs).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(cmp_btns, text="Снять всё", width=92, height=26,
+                      fg_color="transparent", border_width=1,
+                      command=self._cmp_clear_abs).pack(side="left")
+
+        self.cmp_ab_listbox = ctk.CTkTextbox(self.cmp_ab_frame, height=120,
+                                             wrap="none", activatescrollbars=True)
+        # Tk Listbox внутри CTk-фрейма — многосписочный выбор с Ctrl/Shift
+        import tkinter as tk
+        self.cmp_ab_lb = tk.Listbox(self.cmp_ab_frame, selectmode="extended",
+                                    height=6, exportselection=False,
+                                    activestyle="none", font=("Segoe UI", 11),
+                                    bg="#2b2b2b", fg="#e5e5e5",
+                                    selectbackground="#3B82F6", selectforeground="white",
+                                    highlightthickness=1, highlightbackground="#555")
+        self.cmp_ab_lb.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.cmp_ab_hint = ctk.CTkLabel(self.cmp_ab_frame, text="",
+                                       font=ctk.CTkFont(size=11),
+                                       text_color=("gray45", "gray65"))
+        self.cmp_ab_hint.grid(row=2, column=0, sticky="w", pady=(3, 0))
+
+        # Чекбоксы клиник (заполняются после чтения исходного файла)
+        clinic_row = ctk.CTkFrame(cf_inner, fg_color="transparent")
+        clinic_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        clinic_row.columnconfigure(1, weight=1)
+        self.cmp_clinic_title = ctk.CTkLabel(clinic_row,
+                                             text="Клиники для сравнения\n(отметьте минимум две):",
+                                             font=ctk.CTkFont(size=12), justify="left")
+        self.cmp_clinic_title.grid(row=0, column=0, sticky="nw", padx=(0, 8))
+        self.cmp_clinic_box = ctk.CTkFrame(clinic_row, fg_color="transparent")
+        self.cmp_clinic_box.grid(row=0, column=1, sticky="ew")
+        self._clinics_placeholder = ctk.CTkLabel(
+            self.cmp_clinic_box,
+            text="Клиники появятся здесь после выбора исходного файла.",
+            font=ctk.CTkFont(size=12), text_color=("gray45", "gray65"))
+        self._clinics_placeholder.grid(row=0, column=0, sticky="w")
+
+        cmp_presets_row = ctk.CTkFrame(cf_inner, fg_color="transparent")
+        cmp_presets_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ctk.CTkButton(cmp_presets_row, text="💾 Сохранить настройки сравнения…",
+                      width=230, height=28, fg_color="transparent", border_width=1,
+                      command=self._save_compare_settings).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(cmp_presets_row, text="📂 Загрузить настройки сравнения…",
+                      width=230, height=28, fg_color="transparent", border_width=1,
+                      command=self._load_compare_settings).pack(side="left")
+
+        self.cmp_info = ctk.CTkLabel(cinner, text="",
+                                     font=ctk.CTkFont(size=12),
+                                     text_color=("gray40", "gray65"), justify="left")
+        self.cmp_info.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         # Конструктор листов + опции + кнопки запуска
         actions = ctk.CTkFrame(body, fg_color="transparent")

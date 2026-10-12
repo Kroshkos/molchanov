@@ -1457,6 +1457,97 @@ def _clinic_codes(data):
     return clinics
 
 
+def get_file_info(filepath, log_func=None):
+    """Возвращает (список клиник, список антибиотиков) исходного файла.
+
+    Используется интерфейсом: клиники — для чекбоксов режима «Сравнение
+    клиник» и выбора клиники на главном окне; антибиотики — для конструктора.
+    """
+    _, _, data, antibiotics, _ = load_data(filepath, log_func=log_func)
+    return _clinic_codes(data), list(antibiotics)
+
+
+def count_rows_by_clinic(data):
+    """dict {клиника: число строк посевов} — для подписей чекбоксов."""
+    counts = {}
+    if data is not None and 'clinic' in getattr(data, 'columns', []):
+        vc = data['clinic'].dropna().astype(str).str.strip().value_counts()
+        for cl, n in vc.items():
+            if cl and cl != DEFAULT_CLINIC_LABEL:
+                counts[cl] = int(n)
+    return counts
+
+
+def _cmp_block_stats(sub, data, col_lab, row_fields, combos):
+    """Считает строки блока (клиника × антибиотик) в формате листа 3.
+
+    Возвращает (rows_out, total_row, s_list, labels_out):
+      rows_out  — строки [ключ группы..., S, I, R, НД, Total, S%, I%, R%, НД%];
+      total_row — итоговая строка «ВСЕГО» в том же формате;
+      s_list/labels_out — значения S% и подписи строк для графика.
+    Строки сортируются по общему списку комбинаций (combos), поэтому блоки
+    разных клиник содержат одинаковые наборы «микроорганизм × материал»
+    в одном порядке — сравнение визуально сопоставимо.
+    """
+    def _rsi(v):
+        if isinstance(v, str):
+            s = v.strip().upper()
+            return s if s in AB_METRICS else 'НД'
+        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
+
+    if col_lab is not None and col_lab in data.columns:
+        rsi_src = data.loc[sub.index, col_lab]
+    else:
+        rsi_src = pd.Series(index=sub.index, dtype=object)
+    tmp = pd.DataFrame({'_rsi': rsi_src.apply(_rsi)})
+    if row_fields:
+        for f in row_fields:
+            tmp[f] = sub[f].values
+        counts = tmp.groupby(row_fields + ['_rsi']).size().unstack('_rsi', fill_value=0)
+        if isinstance(counts.index, pd.MultiIndex):
+            counts = counts.reset_index()
+        counts = counts.reset_index(drop=True)
+    else:
+        vc = tmp['_rsi'].value_counts()
+        counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
+    for m in AB_METRICS:
+        if m not in counts.columns:
+            counts[m] = 0
+
+    stats = {}
+    for _, r in counts.iterrows():
+        key = tuple(str(r[f]) for f in row_fields) if row_fields else ('Все данные',)
+        s, i_, rr, nd = (int(r.get('S', 0)), int(r.get('I', 0)),
+                        int(r.get('R', 0)), int(r.get('НД', 0)))
+        tot = s + i_ + rr + nd
+        tf = float(tot) if tot else np.nan
+        pcts = [round(x / tf * 100, 1) if tf == tf else 0.0 for x in (s, i_, rr, nd)]
+        stats[key] = [s, i_, rr, nd, tot] + pcts
+
+    rows_out, s_list, labels_out = [], [], []
+    for key in combos:
+        if key not in stats:
+            continue
+        vals = stats[key]
+        rows_out.append(list(key) + vals)
+        s_list.append(vals[5])
+        lbl = ' | '.join(key) if row_fields else 'Все данные'
+        labels_out.append(lbl)
+    if not rows_out:
+        return rows_out, None, s_list, labels_out
+
+    arr = np.array([stats[k] for k in combos if k in stats], dtype=float)
+    sums = arr.sum(axis=0)
+    stot = sums[4]
+    total_row = (['ВСЕГО'] * max(len(row_fields), 1) +
+                 [int(sums[0]), int(sums[1]), int(sums[2]), int(sums[3]), int(stot),
+                  round(sums[0] / stot * 100, 1) if stot else 0.0,
+                  round(sums[1] / stot * 100, 1) if stot else 0.0,
+                  round(sums[2] / stot * 100, 1) if stot else 0.0,
+                  round(sums[3] / stot * 100, 1) if stot else 0.0])
+    return rows_out, total_row, s_list, labels_out
+
+
 def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_func=None):
     """Лист(ы) отдельного режима «Сравнение клиник».
 
@@ -1521,12 +1612,6 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     else:
         combos = [('Все данные',)]
 
-    def _rsi(v):
-        if isinstance(v, str):
-            s = v.strip().upper()
-            return s if s in AB_METRICS else 'НД'
-        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
-
     # индексы колонок данных: position -> column label
     col_labels_map = {}
     for i, c in enumerate(data.columns):
@@ -1542,49 +1627,10 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             sub = pos[pos['clinic'].astype(str).str.strip() == cl] if 'clinic' in pos.columns else pos
             if sub.empty:
                 continue
-            rsi_src = data.loc[sub.index, col_lab] if col_lab in data.columns else pd.Series(index=sub.index, dtype=object)
-            tmp = pd.DataFrame({'_rsi': rsi_src.apply(_rsi)})
-            if row_fields:
-                for f in row_fields:
-                    tmp[f] = sub[f].values
-                counts = tmp.groupby(row_fields + ['_rsi'], dropna=False).size().unstack('_rsi', fill_value=0)
-                if isinstance(counts.index, pd.MultiIndex):
-                    counts = counts.reset_index()
-                counts = counts.reset_index(drop=True)
-            else:
-                vc = tmp['_rsi'].value_counts()
-                counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
-            for m in AB_METRICS:
-                if m not in counts.columns:
-                    counts[m] = 0
-            rows_out = []
-            s_list, labels_out = [], []
-            for _, r in counts.iterrows():
-                key = tuple(str(r[f]) for f in row_fields) if row_fields else ('Все данные',)
-                if key not in combos:
-                    continue
-                s, i_, rr, nd = (int(r['S']), int(r['I']), int(r['R']), int(r['НД']))
-                tot = s + i_ + rr + nd
-                tf = float(tot) if tot else np.nan
-                pcts = [round(x / tf * 100, 1) if tf == tf else 0.0 for x in (s, i_, rr, nd)]
-                rows_out.append(list(key) + [s, i_, rr, nd, tot] + pcts)
-                s_list.append(pcts[0])
-                lbl = ' | '.join([ab] + list(key)) if row_fields else ab
-                labels_out.append(lbl)
+            rows_out, total_row, s_list, labels_out = _cmp_block_stats(
+                sub, data, col_lab, row_fields, combos)
             if not rows_out:
                 continue
-            order = np.argsort(labels_out, kind='stable')
-            rows_out = [rows_out[k] for k in order]
-            arr = np.array([[r[len(row_fields) + j] for j in range(8)] for r in rows_out], dtype=float)
-            sums = arr.sum(axis=0)
-            stot = sums[4]
-            spct = round(sums[0] / stot * 100, 1) if stot else 0.0
-            ipct = round(sums[1] / stot * 100, 1) if stot else 0.0
-            rpct = round(sums[2] / stot * 100, 1) if stot else 0.0
-            npct = round(sums[3] / stot * 100, 1) if stot else 0.0
-            total_row = (['ВСЕГО'] * len(row_fields) +
-                         [int(sums[0]), int(sums[1]), int(sums[2]), int(sums[3]), int(stot),
-                          spct, ipct, rpct, npct])
             blocks.append((ab, cl, rows_out, total_row))
             chart_data.append((ab, cl, list(zip(labels_out, s_list))))
 
@@ -1820,6 +1866,12 @@ def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=N
     """
     df_main, ab_data, data, antibiotics, ab_indices = load_data(
         input_path, log_func=log_func)
+    # клиники из спецификации должны существовать в текущем файле;
+    # если ни одна не совпала — сравниваем все найденные клиники
+    known = _clinic_codes(data)
+    valid_clinics = [c for c in (spec.get('clinics') or []) if c in known]
+    spec = dict(spec)
+    spec['clinics'] = valid_clinics
     errs = validate_spec(spec, available_antibiotics=antibiotics)
     if errs:
         raise ValueError(errs[0])
@@ -1834,6 +1886,32 @@ def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=N
     if log_func:
         log_func(f"Сравнение клиник сохранено: {output_path}")
     return built
+
+
+def save_compare_preset(spec, path):
+    """Сохраняет настройки режима «Сравнение клиник» в JSON-файл."""
+    import json
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(dict(spec), f, ensure_ascii=False, indent=2)
+
+
+def load_compare_preset(path):
+    """Загружает настройки режима «Сравнение клиник» из JSON-файла."""
+    import json
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Файл пресета не содержит объект настроек.")
+    return {
+        'name': str(data.get('name', 'Сравнение клиник')),
+        'mode': COMPARE_CLINICS_KEY,
+        'clinics': [str(c) for c in data.get('clinics', [])],
+        'antibiotics': [str(a) for a in data.get('antibiotics', [])],
+        'compare_by': [g for g in data.get('compare_by', ['organism'])
+                       if g in ('organism', 'material_raw')] or ['organism'],
+        'filter': str(data.get('filter', 'none')),
+        'metrics': ['ab'],
+    }
 
 # ----------------------------------------------------------------------
 # 8. Сохранение в Excel
