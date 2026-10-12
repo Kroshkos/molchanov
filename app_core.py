@@ -1755,7 +1755,14 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     diff_rows = []      # (abs(d), row_values) — для сводки различий
     used_statuses = set()
     for ab in selected_abs:
-        labels_ab = sorted({lbl for (a, lbl) in s_map if a == ab})
+        # в матрицу попадают только наборы «микроорганизм / материал», по
+        # которым ХОТЬ ОДНА клиника реально тестировала антибиотик (есть
+        # определения S/I/R). Наборы без единого теста (и строки, где все
+        # клиники показали бы «нет посевов»/«нет теста») из таблицы исключаются.
+        labels_ab = sorted(
+            lbl for lbl in {l for (a, l) in s_map if a == ab}
+            if any(d_map.get((ab, lbl), {}).get(cl, 0) >= CMP_MIN_DEFINED
+                   for cl in clinics))
         if not labels_ab:
             continue
         matrix_rows.append([f"Антибиотик: {ab}"] + [''] * (len(clinics) + 2))
@@ -1854,6 +1861,12 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
                 if lbl not in labels:
                     labels.append(lbl)
         labels.sort()
+        # в график включаем только наборы «микроорганизм / материал», по которым
+        # есть данные хотя бы у одной клиники-участницы (dmaps уже содержит
+        # только реально протестированные значения); пустые столбцы не рисуем
+        labels = [l for l in labels if any(l in dmaps[cl] for cl in cl_list)]
+        if not labels:
+            continue
         # приоритет: диапазоны, присутствующие во всех клиниках-участницах
         common = [l for l in labels if all(l in dmaps[cl] for cl in cl_list)]
         ordered = (common + [l for l in labels if l not in set(common)])[:COMPARE_CHART_MAX_POINTS]
@@ -1870,15 +1883,19 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         group_rows.append([''] * (len(labels) + 1))
     while group_rows and all(c in ('', None) for c in group_rows[-1]):
         group_rows.pop()
-    chart_df = pd.DataFrame(group_rows) if group_rows else pd.DataFrame()
-
-    if not chart_df.empty:
-        result[chart_name] = chart_df
+    # лист графиков остаётся даже если графиков нет — с поясняющей строкой
+    if group_rows:
+        chart_df = pd.DataFrame(group_rows)
+    else:
+        chart_df = pd.DataFrame([[
+            'Графики не построены: ни по одному набору «микроорганизм / материал» '
+            'нет данных с тестированием антибиотика хотя бы в одной клинике.']])
 
     if log_func:
         log_func(f"Сравнение клиник «{spec.get('name')}»: {len(selected_abs)} антибиотик(ов), "
                  f"{len(clinics)} клиник ({', '.join(clinics)}), "
                  f"{len(blocks)} блоков; листы: «{tab_name}», «{matrix_name}», «{chart_name}».")
+    result[chart_name] = chart_df
     return result, compare_meta
 
 
