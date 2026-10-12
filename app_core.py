@@ -799,7 +799,16 @@ TOTAL_GROUP_KEY = 'total'
 
 #: Специальный режим конструктора: сравнение клиник — антибиотикограмма на
 #: одни и те же микроорганизмы/материал в условиях разных клиник.
+#: Лист повторяет структуру листа 3 (блоки «Антибиотик: …», строки —
+#: микроорганизм × локализация, колонки S/I/R/НД/Total/S%/I%/R%/НД%), но
+#: вместо общей выборки даёт отдельные блоки для каждой клиники; вместе с
+#: таким листом автоматически создаётся лист с графиком сравнения.
 COMPARE_CLINICS_KEY = '__compare_clinics__'
+
+#: Максимальное число блоков-клиник на одном графике (листья Excel)
+COMPARE_CHART_MAX_BLOCKS = 8
+#: Максимальное число столбцов (диапазон АБ × микроорганизм) на графике
+COMPARE_CHART_MAX_POINTS = 60
 
 #: Специальное значение в выборе антибиотика: «Все антибиотики» — суммарная
 #: антибиотикограмма по всем АБ-колонкам исходного файла сразу.
@@ -1344,24 +1353,29 @@ def validate_spec(spec, available_antibiotics=None):
     if len(name) > 31:
         errors.append("Название листа не должно превышать 31 символ.")
     is_compare = spec.get('mode') == COMPARE_CLINICS_KEY
-    groups_key = 'compare_by' if is_compare else 'groups'
-    groups = [g for g in spec.get(groups_key, []) if g in dict(GROUP_FIELDS)]
+    if is_compare:
+        # отдельный режим «Сравнение клиник»: список антибиотиков + клиники
+        abs_list = [a for a in (spec.get('antibiotics') or
+                                ([spec['antibiotic']] if spec.get('antibiotic') else []))
+                    if a and a != AB_ALL_KEY]
+        if not abs_list:
+            errors.append("Для сравнения клиников выберите хотя бы один антибиотик "
+                          "(пустой список = все антибиотики файла).")
+        if available_antibiotics is not None:
+            missing = [a for a in abs_list if a not in available_antibiotics]
+            if missing:
+                errors.append("Антибиотики отсутствуют в текущем исходном файле: "
+                              + ", ".join(missing[:5]))
+        clinics = [c for c in (spec.get('clinics') or []) if c]
+        if len(clinics) < 2:
+            errors.append("Для сравнения отметьте минимум две клиники.")
+        return errors
+    groups = [g for g in spec.get('groups', []) if g in dict(GROUP_FIELDS)]
     if not groups:
         # не ошибка: будет построен итог «всё вместе»
         pass
     metrics = [m for m in spec.get('metrics', [])
                if m == 'ab' or m in {k for k, _ in METRIC_OPTIONS}]
-    if is_compare:
-        # сравнение клиник — это всегда антибиотикограмма по выбранному АБ
-        ab = spec.get('antibiotic', '')
-        if not ab:
-            errors.append("Для сравнения клиников выберите антибиотик.")
-        elif ab == AB_ALL_KEY:
-            errors.append("Сравнение клиников строится по одному антибиотику — "
-                          "выберите конкретный, а не «Все антибиотики».")
-        elif available_antibiotics is not None and ab not in available_antibiotics:
-            errors.append(f"Антибиотик «{ab}» отсутствует в текущем исходном файле.")
-        return errors
     if 'ab' in metrics:
         ab = spec.get('antibiotic', '')
         if not ab:
@@ -1402,7 +1416,9 @@ def load_sheet_specs(path):
             'antibiotic': str(item.get('antibiotic', '')),
             'filter': str(item.get('filter', 'none')),
             **({'mode': COMPARE_CLINICS_KEY,
-                'compare_by': list(item.get('compare_by', ['organism']))} if mode else {}),
+                'compare_by': list(item.get('compare_by', ['organism'])),
+                'antibiotics': list(item.get('antibiotics', [])),
+                'clinics': list(item.get('clinics', []))} if mode else {}),
         })
     return specs
 
@@ -1420,135 +1436,233 @@ def filter_data_by_clinic(data, antibiotics, ab_indices, clinic):
     return data[mask].copy(), antibiotics, ab_indices
 
 
-def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_func=None):
-    """Лист сравнения клиник: чувствительность одного антибиотика к одним и тем
-    же микроорганизмам/материалам в условиях разных клиник.
+# --- Отдельный режим работы: сравнение клиник ---------------------------
 
-    Строки — комбинации выбранных полей группировки (по умолчанию —
-    микроорганизм), столбцы — клиники (S%, I%, R% и число определений n),
-    последний блок «Все клиники» — суммарно по выборке. Значения S%/R%
-    позволяют сразу увидеть различия в работоспособности антибиотика между
-    клиниками.
-    """
-    compare_by = [g for g in spec.get('compare_by', ['organism'])
-                  if g in dict(GROUP_FIELDS)]
-    if not compare_by:
-        compare_by = ['organism']
-    group_cols, col_labels = resolve_group_fields(compare_by)
+#: Пункт выбора клиники на главном окне: отдельный режим «Сравнение клиник»
+COMPARE_CLINICS_LABEL = '⚖️ Сравнение клиник'
 
-    antibiotic = spec.get('antibiotic', '')
-    if not antibiotic:
-        raise ValueError("Для листа сравнения клиник выберите антибиотик.")
 
-    # клиники в порядке встречаемости в данных
+def get_compare_sheet_names(spec_name):
+    """Имена листов режима сравнения: таблица + лист с графиком."""
+    base = sanitize_sheet_name(str(spec_name).strip())[:25] or 'Сравнение'
+    return base, sanitize_sheet_name(f'{base} (график)')
+
+
+def _clinic_codes(data):
+    """Клиники в порядке встречаемости (без служебной «общей выборки»)."""
     clinics = []
-    if 'clinic' in data.columns:
+    if data is not None and 'clinic' in getattr(data, 'columns', []):
         for c in data['clinic'].dropna().astype(str).str.strip():
             if c and c != DEFAULT_CLINIC_LABEL and c not in clinics:
                 clinics.append(c)
-    if len(clinics) < 2:
+    return clinics
+
+
+def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_func=None):
+    """Лист(ы) отдельного режима «Сравнение клиник».
+
+    Возвращает dict {имя листа: DataFrame}. Табличный лист повторяет
+    структуру листа 3 (антибиотикорезистентность): блоки заголовков
+    «Антибиотик: …», строки — микроорганизм × локализация, колонки
+    S / I / R / НД / Total / S% / I% / R% / НД%. Отличие — каждый блок
+    сравнивает одни и те же антибиотики, микроорганизмы и материал
+    в условиях разных клиник: под общим заголовком идёт подзаголовок
+    клиники, затем строки по этой клинике и итоговая строка «ВСЕГО».
+    Вместе с таблицей создаётся лист с графиками S% по клиникам.
+
+    Ключи спецификации:
+      antibiotics — список антибиотиков (пусто/AB_ALL_KEY — все найденные);
+      compare_by  — поля строк: 'organism' и/или 'material_raw';
+      clinics     — список клиник для сравнения (пусто — все из файла);
+      filter      — обычный фильтр конструктора (применяется ко всем блокам).
+    """
+    # --- разбор спецификации ---
+    compare_by = [g for g in spec.get('compare_by', ['organism'])
+                  if g in ('organism', 'material_raw')]
+    if not compare_by:
+        compare_by = ['organism']
+
+    wanted_abs = [a for a in (spec.get('antibiotics') or
+                              ([spec['antibiotic']] if spec.get('antibiotic') else []))
+                  if a and a != AB_ALL_KEY]
+    if wanted_abs:
+        selected_abs = [a for a in antibiotics if a in set(wanted_abs)]
+    else:
+        selected_abs = list(antibiotics)
+    if not selected_abs:
+        raise ValueError("Для сравнения клиник выберите хотя бы один антибиотик "
+                         "(иначе лист будет пуст).")
+
+    all_clinics = _clinic_codes(data)
+    if len(all_clinics) < 2:
         raise ValueError("В исходном файле не найдено минимум двух клиник — "
                          "сравнивать нечего.")
+    wanted_clinics = [c for c in (spec.get('clinics') or []) if c in all_clinics]
+    clinics = wanted_clinics if len(wanted_clinics) >= 2 else all_clinics
+    if len(clinics) < 2:
+        raise ValueError("Для сравнения отметьте минимум две клиники.")
 
+    # --- строки таблицы: посевы (фильтр) + антибиотикограмма по АБ-колонкам ---
     filtered = apply_spec_filter(base_df, spec)
-    # оставляем только строки реально сравниваемых клиник
-    if 'clinic' in filtered.columns:
-        filtered = filtered[filtered['clinic'].isin(clinics)]
+    pos = filtered[filtered['is_positive']].copy() if 'is_positive' in filtered.columns else filtered.copy()
+    if pos.empty:
+        raise ValueError("После фильтра не осталось проб с ростом — сравнение пустое.")
 
-    # ключевая таблица строк (комбинации группировки) из посева
-    if group_cols:
-        keys_df = (filtered[[c for c in group_cols if c in filtered.columns]]
-                   .drop_duplicates().reset_index(drop=True))
+    row_fields = []
+    if 'organism' in compare_by:
+        row_fields.append('organism')
+    if 'material_raw' in compare_by:
+        row_fields.append('material_raw')
+    for f in row_fields:
+        if f not in pos.columns:
+            pos[f] = ''
+        pos[f] = pos[f].fillna('').astype(str).str.strip()
+    if row_fields:
+        combos = sorted(set(map(tuple, pos[row_fields].drop_duplicates().values.tolist())))
     else:
-        keys_df = pd.DataFrame({'Группа': ['Все данные']})
+        combos = [('Все данные',)]
 
-    merged = keys_df
-    for cl in clinics:
-        sub = data[data['clinic'].astype(str).str.strip() == cl]
-        st = compute_ab_group_stats(sub, antibiotics, ab_indices, group_cols,
-                                    antibiotic, base_df=base_df)
-        st = st.rename(columns={'S': f'S ({cl})', 'I': f'I ({cl})',
-                                'R': f'R ({cl})', 'НД': f'НД ({cl})',
-                                'Total': f'n ({cl})', 'S%': f'S% ({cl})',
-                                'I%': f'I% ({cl})', 'R%': f'R% ({cl})',
-                                'НД%': f'НД% ({cl})'})
-        keep = [c for c in st.columns if c.startswith(('S', 'I', 'R', 'НД', 'n'))]
-        if group_cols:
-            on = [c for c in group_cols if c in st.columns and c in merged.columns]
-            merged = merged.merge(st[on + keep], on=on, how='left')
-        else:
-            merged = pd.concat([merged.reset_index(drop=True),
-                                st[keep].reset_index(drop=True)], axis=1)
+    def _rsi(v):
+        if isinstance(v, str):
+            s = v.strip().upper()
+            return s if s in AB_METRICS else 'НД'
+        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
 
-    # итоговый блок «Все клиники» — по всей выборке целиком
-    tot = compute_ab_group_stats(data, antibiotics, ab_indices, group_cols,
-                                 antibiotic, base_df=base_df)
-    tot = tot.rename(columns={'S': 'S (все)', 'I': 'I (все)', 'R': 'R (все)',
-                              'НД': 'НД (все)', 'Total': 'n (все)',
-                              'S%': 'S% (все)', 'I%': 'I% (все)',
-                              'R%': 'R% (все)', 'НД%': 'НД% (все)'})
-    tkeep = [c for c in tot.columns if c.endswith('(все)')]
-    if group_cols:
-        on = [c for c in group_cols if c in tot.columns and c in merged.columns]
-        merged = merged.merge(tot[on + tkeep], on=on, how='left')
-    else:
-        merged = pd.concat([merged.reset_index(drop=True),
-                            tot[tkeep].reset_index(drop=True)], axis=1)
+    # индексы колонок данных: position -> column label
+    col_labels_map = {}
+    for i, c in enumerate(data.columns):
+        col_labels_map[i] = c
 
-    # разница max(S%) - min(S%) между клиниками — наглядный индикатор различий
-    spct = [f'S% ({cl})' for cl in clinics if f'S% ({cl})' in merged.columns]
-    if len(spct) >= 2:
-        sub_vals = merged[spct]
-        merged['Δ S% (макс-мин)'] = (sub_vals.max(axis=1) - sub_vals.min(axis=1)).round(1)
-
-    # переименовываем технические колонки группировки в человекочитаемые
-    merged = merged.rename(columns=col_labels)
-    display_cols = [col_labels[c] for c in group_cols if c in col_labels]
-
-    # упорядочиваем столбцы: группы → по клиникам (n, S%, I%, R%, НД%) → все → Δ
-    metric_order = ['n', 'S%', 'I%', 'R%', 'НД%']
-    ordered = []
-    for m in metric_order:
+    blocks = []          # (ab, clinic, rows(list), total_row(list))
+    chart_data = []      # (ab, clinic, [(label, S%)])
+    for ab in selected_abs:
+        idx = antibiotics.index(ab)
+        col_i = ab_indices[idx]
+        col_lab = col_labels_map.get(col_i)
         for cl in clinics:
-            c = f'{m} ({cl})'
-            if c in merged.columns:
-                ordered.append(c)
-    for m in metric_order:
-        c = f'{m} (все)'
-        if c in merged.columns:
-            ordered.append(c)
-    rest = [c for c in merged.columns if c not in display_cols and c not in ordered]
-    merged = merged[display_cols + ordered + rest]
+            sub = pos[pos['clinic'].astype(str).str.strip() == cl] if 'clinic' in pos.columns else pos
+            if sub.empty:
+                continue
+            rsi_src = data.loc[sub.index, col_lab] if col_lab in data.columns else pd.Series(index=sub.index, dtype=object)
+            tmp = pd.DataFrame({'_rsi': rsi_src.apply(_rsi)})
+            if row_fields:
+                for f in row_fields:
+                    tmp[f] = sub[f].values
+                counts = tmp.groupby(row_fields + ['_rsi'], dropna=False).size().unstack('_rsi', fill_value=0)
+                if isinstance(counts.index, pd.MultiIndex):
+                    counts = counts.reset_index()
+                counts = counts.reset_index(drop=True)
+            else:
+                vc = tmp['_rsi'].value_counts()
+                counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
+            for m in AB_METRICS:
+                if m not in counts.columns:
+                    counts[m] = 0
+            rows_out = []
+            s_list, labels_out = [], []
+            for _, r in counts.iterrows():
+                key = tuple(str(r[f]) for f in row_fields) if row_fields else ('Все данные',)
+                if key not in combos:
+                    continue
+                s, i_, rr, nd = (int(r['S']), int(r['I']), int(r['R']), int(r['НД']))
+                tot = s + i_ + rr + nd
+                tf = float(tot) if tot else np.nan
+                pcts = [round(x / tf * 100, 1) if tf == tf else 0.0 for x in (s, i_, rr, nd)]
+                rows_out.append(list(key) + [s, i_, rr, nd, tot] + pcts)
+                s_list.append(pcts[0])
+                lbl = ' | '.join([ab] + list(key)) if row_fields else ab
+                labels_out.append(lbl)
+            if not rows_out:
+                continue
+            order = np.argsort(labels_out, kind='stable')
+            rows_out = [rows_out[k] for k in order]
+            arr = np.array([[r[len(row_fields) + j] for j in range(8)] for r in rows_out], dtype=float)
+            sums = arr.sum(axis=0)
+            stot = sums[4]
+            spct = round(sums[0] / stot * 100, 1) if stot else 0.0
+            ipct = round(sums[1] / stot * 100, 1) if stot else 0.0
+            rpct = round(sums[2] / stot * 100, 1) if stot else 0.0
+            npct = round(sums[3] / stot * 100, 1) if stot else 0.0
+            total_row = (['ВСЕГО'] * len(row_fields) +
+                         [int(sums[0]), int(sums[1]), int(sums[2]), int(sums[3]), int(stot),
+                          spct, ipct, rpct, npct])
+            blocks.append((ab, cl, rows_out, total_row))
+            chart_data.append((ab, cl, list(zip(labels_out, s_list))))
 
-    # заполняем пропуски (группа встречалась не во всех клиниках)
-    for c in merged.columns:
-        if c in display_cols:
+    if not blocks:
+        raise ValueError("По выбранным антибиотикам и клиникам нет определений "
+                         "чувствительности — измените настройки сравнения.")
+
+    # --- сборка табличного DataFrame в стиле листа 3 ---
+    header = (['Микроорганизм', 'Локализация'] if len(row_fields) == 2 else
+              ['Микроорганизм'] if row_fields == ['organism'] else
+              ['Локализация'] if row_fields == ['material_raw'] else ['Группа'])
+    header += AB_METRICS + ['Total'] + [f'{m}%' for m in AB_METRICS]
+    ncol = len(header)
+    all_rows = []
+    cur_ab = None
+    for ab, cl, rows_out, total_row in blocks:
+        if ab != cur_ab:
+            if cur_ab is not None:
+                all_rows.append([''] * ncol)
+            all_rows.append([f"Антибиотик: {ab}"] + [''] * (ncol - 1))
+            cur_ab = ab
+        all_rows.append([f"Клиника: {cl}"] + [''] * (ncol - 1))
+        all_rows.append(header)
+        all_rows.extend(rows_out)
+        all_rows.append(total_row)
+        all_rows.append([''] * ncol)
+    while all_rows and all_rows[-1] == [''] * ncol:
+        all_rows.pop()
+    table_df = pd.DataFrame(all_rows)
+
+    # --- лист с графиками: S% по клиникам для одних и тех же наборов ---
+    groups = []  # (ab, [labels], {clinic: [S%]}, used_labels)
+    by_ab = {}
+    for ab, cl, pairs in chart_data:
+        by_ab.setdefault(ab, []).append((cl, pairs))
+    for ab in selected_abs:
+        if ab not in by_ab:
             continue
-        merged[c] = merged[c].fillna(0)
-        if str(c).startswith('n'):
-            merged[c] = merged[c].astype(int)
+        dmaps = {cl: dict(pairs) for cl, pairs in by_ab[ab]}
+        cl_list = [cl for cl in clinics if cl in dmaps]
+        labels = []
+        for cl in cl_list:
+            for lbl in dmaps[cl]:
+                if lbl not in labels:
+                    labels.append(lbl)
+        labels.sort()
+        # приоритет: диапазоны, присутствующие во всех клиниках
+        common = [l for l in labels if all(l in dmaps[cl] for cl in cl_list)]
+        ordered = (common + [l for l in labels if l not in set(common)])[:COMPARE_CHART_MAX_POINTS]
+        series = {cl: [dmaps[cl].get(l, 0.0) for l in ordered] for cl in cl_list}
+        if ordered:
+            groups.append((ab, ordered, series, cl_list))
+    group_rows = []
+    for ab, labels, series, cl_list in groups:
+        group_rows.append([ab] + [''] * len(labels))
+        group_rows.append(['Клиника'] + labels)
+        for cl in cl_list:
+            group_rows.append([cl] + [round(v, 1) for v in series[cl]])
+        group_rows.append([''] * (len(labels) + 1))
+    while group_rows and group_rows[-1] == ['']:
+        group_rows.pop()
+    chart_df = pd.DataFrame(group_rows) if group_rows else pd.DataFrame()
 
-    # сортировка: по объёму определений в первой клинике / по микроорганизму
-    if group_cols:
-        first_n = f'n ({clinics[0]})'
-        sort_col = first_n if first_n in merged.columns else (
-            'n (все)' if 'n (все)' in merged.columns else None)
-        primary = display_cols[0] if display_cols else None
-        if primary and sort_col:
-            merged = merged.sort_values([primary, sort_col], ascending=[True, False])
-        elif sort_col:
-            merged = merged.sort_values(sort_col, ascending=False)
-    merged = merged.reset_index(drop=True)
+    tab_name, chart_name = get_compare_sheet_names(spec.get('name', 'Сравнение клиник'))
+    result = {tab_name: table_df}
+    if not chart_df.empty:
+        result[chart_name] = chart_df
 
     if log_func:
-        log_func(f"Лист «{spec.get('name')}»: сравнение {len(clinics)} клиник "
-                 f"({', '.join(clinics)}) по антибиотику «{antibiotic}», "
-                 f"{len(merged)} строк.")
-    return merged
+        log_func(f"Сравнение клиник «{spec.get('name')}»: {len(selected_abs)} антибиотик(ов), "
+                 f"{len(clinics)} клиник ({', '.join(clinics)}), "
+                 f"{len(blocks)} блоков, лист графика: «{chart_name}».")
+    return result
 
 
 def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_sheets=None,
-                 clinic=None, preloaded=None):
+                 clinic=None, preloaded=None, base_sheets=True):
     """Полный цикл обработки одной выборки: загрузка -> базовые листы ->
     конструктор -> Excel.
 
@@ -1584,23 +1698,29 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
         if data.empty:
             raise ValueError(f"Клиника «{clinic}» не найдена в исходном файле.")
 
-    if log_func:
-        log_func("Формирование листа 1 (анализ посевов по категориям)...")
-    sheet2 = generate_sheet2(df_main, log_func=log_func)
+    if base_sheets:
+        if log_func:
+            log_func("Формирование листа 1 (анализ посевов по категориям)...")
+        sheet2 = generate_sheet2(df_main, log_func=log_func)
 
-    if log_func:
-        log_func("Формирование листа 2 (эпидемиология по локализациям)...")
-    sheet3 = generate_sheet3(df_main, log_func=log_func)
+        if log_func:
+            log_func("Формирование листа 2 (эпидемиология по локализациям)...")
+        sheet3 = generate_sheet3(df_main, log_func=log_func)
 
-    if log_func:
-        log_func("Формирование листа 3 (общая антибиотикорезистентность)...")
-    sheet4 = generate_antibiotic_sheet(ab_data, log_func=log_func)
+        if log_func:
+            log_func("Формирование листа 3 (общая антибиотикорезистентность)...")
+        sheet4 = generate_antibiotic_sheet(ab_data, log_func=log_func)
+    else:
+        # отдельный режим (например, сравнение клиник): базовые листы не создаются
+        sheet2 = pd.DataFrame()
+        sheet3 = {}
+        sheet4 = pd.DataFrame()
 
     # Листы конструктора
     built_sheets = {}
     if extra_sheets:
         base = prepare_base_table(df_main, data)
-        used_names = {'1', '2', '3'}
+        used_names = {'1', '2', '3'} if base_sheets else set()
         for n, spec in enumerate(extra_sheets, start=1):
             errs = validate_spec(spec, available_antibiotics=antibiotics)
             if errs:
@@ -1609,30 +1729,37 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                 continue
             try:
                 if spec.get('mode') == COMPARE_CLINICS_KEY:
-                    df_sheet = build_clinic_comparison(
+                    res = build_clinic_comparison(
                         spec, cmp_state['base'], cmp_state['data'],
                         cmp_state['antibiotics'], cmp_state['ab_indices'],
                         log_func=log_func)
+                    # режим сравнения возвращает dict {имя: DataFrame}
+                    dfs = res if isinstance(res, dict) else {spec['name']: res}
                 else:
                     df_sheet = build_sheet_from_spec(spec, base, data, antibiotics, ab_indices,
                                                      log_func=log_func)
+                    dfs = {str(spec['name']).strip(): df_sheet}
             except ValueError as e:
                 if log_func:
                     log_func(f"Лист №{n}: {e} — лист пропущен.")
                 continue
-            if df_sheet is not None and not df_sheet.empty:
-                nm = sanitize_sheet_name(str(spec['name']).strip())
+            for raw_name, df_sheet in dfs.items():
+                if df_sheet is None or df_sheet.empty:
+                    continue
+                nm = sanitize_sheet_name(str(raw_name).strip())
                 k = 1
                 while nm in used_names:
                     k += 1
-                    nm = f"{sanitize_sheet_name(str(spec['name']).strip())[:28]}_{k}"
+                    nm = f"{sanitize_sheet_name(str(raw_name).strip())[:28]}_{k}"
                 used_names.add(nm)
                 built_sheets[nm] = df_sheet
 
     save_to_excel(sheet2, sheet3, sheet4, output_path,
                   log_func=log_func, styled=styled,
                   raw_data=data,
-                  user_sheets=built_sheets)
+                  user_sheets=built_sheets, base_sheets=base_sheets,
+                  chart_sheets={k: v for k, v in built_sheets.items()
+                                if '(график)' in k})
 
     if log_func:
         log_func("Обработка успешно завершена!")
@@ -1680,19 +1807,52 @@ def run_pipeline_multi_clinic(input_path, output_path, styled=True, log_func=Non
         log_func(f"Готово: создано {len(results)} файлов (по одному на клинику).")
     return results
 
+
+def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=None):
+    """Отдельный режим работы «Сравнение клиник».
+
+    Строит только листы сравнения (таблица в стиле листа 3 + лист с
+    графиками); базовые листы 1–3 НЕ создаются. Спецификация:
+      spec.clinics    — отмеченные чекбоксами клиники из исходного файла;
+      spec.antibiotics — антибиотики для сравнения (пусто — все);
+      spec.compare_by — 'organism' и/или 'material_raw' (строки таблиц);
+      spec.filter     — обычный фильтр конструктора.
+    Возвращает dict {имя листа: DataFrame}.
+    """
+    df_main, ab_data, data, antibiotics, ab_indices = load_data(
+        input_path, log_func=log_func)
+    errs = validate_spec(spec, available_antibiotics=antibiotics)
+    if errs:
+        raise ValueError(errs[0])
+    base = prepare_base_table(df_main, data)
+    built = build_clinic_comparison(spec, base, data, antibiotics, ab_indices,
+                                    log_func=log_func)
+    save_to_excel(pd.DataFrame(), {}, pd.DataFrame(), output_path,
+                  log_func=log_func, styled=styled, raw_data=data,
+                  user_sheets=built, base_sheets=False,
+                  chart_sheets={k: v for k, v in built.items()
+                                if '(график)' in k})
+    if log_func:
+        log_func(f"Сравнение клиник сохранено: {output_path}")
+    return built
+
 # ----------------------------------------------------------------------
 # 8. Сохранение в Excel
 # ----------------------------------------------------------------------
 
 def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                   log_func=None, styled=False, raw_data=None, wound_data=None,
-                  user_sheets=None):
+                  user_sheets=None, base_sheets=True, chart_sheets=None):
     """
     Сохраняет аналитические листы в Excel.
-    Первые три листа всегда базовые: «1» (анализ посевов), «2» (эпидемиология),
-    «3» (резистентность). Остальные листы добавляются конструктором
-    (user_sheets — dict {имя: DataFrame}); при styled=True дополнительно
-    создаются справочные листы «Сводка» и «Данные».
+    При base_sheets=True первые три листа всегда базовые: «1» (анализ посевов),
+    «2» (эпидемиология), «3» (резистентность). Остальные листы добавляются
+    конструктором (user_sheets — dict {имя: DataFrame}); при styled=True
+    дополнительно создаются справочные листы «Сводка» и «Данные».
+    base_sheets=False используется отдельным режимом «Сравнение клиник» —
+    базовые листы не создаются.
+    chart_sheets — dict {имя листа: DataFrame} для листов с графиками: после
+    записи таблицы на такой лист добавляются столбчатые диаграммы openpyxl.
     styled=True — современное оформление (шапки, зебра, заморозка панелей,
     условное форматирование % чувствительности).
     """
@@ -1703,44 +1863,48 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
         os.makedirs(dirname, exist_ok=True)
 
     user_sheets = user_sheets or {}
+    chart_sheets = chart_sheets or {}
 
     with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        sheet2_df.to_excel(writer, sheet_name='1', index=False)
+        if base_sheets:
+            sheet2_df.to_excel(writer, sheet_name='1', index=False)
 
-        # Лист 2
-        sheet3_rows = []
-        for section_name, section_df in sheet3_dict.items():
-            sheet3_rows.append([section_name] + [''] * (len(section_df.columns)-1))
-            sheet3_rows.append(section_df.columns.tolist())
-            for _, row in section_df.iterrows():
-                sheet3_rows.append(row.tolist())
-            sheet3_rows.append([''] * len(section_df.columns))
-        if sheet3_rows:
-            max_cols = max(len(row) for row in sheet3_rows)
-            for row in sheet3_rows:
-                if len(row) < max_cols:
-                    row.extend([''] * (max_cols - len(row)))
-            sheet3_combined = pd.DataFrame(sheet3_rows)
-            sheet3_combined.to_excel(writer, sheet_name='2', index=False, header=False)
+            # Лист 2
+            sheet3_rows = []
+            for section_name, section_df in sheet3_dict.items():
+                sheet3_rows.append([section_name] + [''] * (len(section_df.columns)-1))
+                sheet3_rows.append(section_df.columns.tolist())
+                for _, row in section_df.iterrows():
+                    sheet3_rows.append(row.tolist())
+                sheet3_rows.append([''] * len(section_df.columns))
+            if sheet3_rows:
+                max_cols = max(len(row) for row in sheet3_rows)
+                for row in sheet3_rows:
+                    if len(row) < max_cols:
+                        row.extend([''] * (max_cols - len(row)))
+                sheet3_combined = pd.DataFrame(sheet3_rows)
+                sheet3_combined.to_excel(writer, sheet_name='2', index=False, header=False)
 
-        # Лист 3
-        if not sheet4_df.empty:
-            sheet4_df.to_excel(writer, sheet_name='3', index=False, header=False)
+            # Лист 3
+            if not sheet4_df.empty:
+                sheet4_df.to_excel(writer, sheet_name='3', index=False, header=False)
 
         # Листы конструктора
         for name, df_sheet in user_sheets.items():
-            df_sheet.to_excel(writer, sheet_name=name[:31], index=False)
+            df_sheet.to_excel(writer, sheet_name=name[:31], index=False,
+                              header=False if name in chart_sheets else True)
 
         extra_sheets = list(user_sheets.keys())
         if styled:
-            summary_df = _build_summary(raw_data, sheet2_df)
+            summary_df = _build_summary(raw_data, sheet2_df) if base_sheets else None
             if summary_df is not None:
                 summary_df.to_excel(writer, sheet_name='Сводка', index=False)
                 extra_sheets.append('Сводка')
             if raw_data is not None and not raw_data.empty:
                 _write_raw_sheet(raw_data, writer)
                 extra_sheets.append('Данные')
-            _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets)
+            _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets,
+                           base_sheets=base_sheets)
 
         else:
             # Автонастройка ширины столбцов (как в базовой версии)
@@ -1757,6 +1921,11 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                             pass
                     adjusted_width = min(max_length + 2, 50)
                     worksheet.column_dimensions[column_letter].width = adjusted_width
+
+        # Графики сравнения клиников (листы «… (график)»)
+        for name in chart_sheets:
+            if name in writer.sheets:
+                _add_comparison_charts(writer.sheets[name], log_func=log_func)
 
     if log_func:
         log_func("Сохранение завершено.")
@@ -1809,11 +1978,91 @@ def _write_raw_sheet(raw_data, writer):
     out.to_excel(writer, sheet_name='Данные', index=False)
 
 
-def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets):
+def _sheet_has_blocks(ws, max_scan_rows=5):
+    """Лист построен блоками («Антибиотик: …») — оформляется как лист 3."""
+    try:
+        for r in range(1, min(max_scan_rows, ws.max_row) + 1):
+            v = ws.cell(row=r, column=1).value
+            if v and str(v).startswith(('Антибиотик:', 'Клиника:')):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _add_comparison_charts(ws, log_func=None):
+    """Добавляет столбчатые диаграммы на лист графика сравнения клиник.
+
+    Структура листа (см. build_clinic_comparison): блок из трёх строк —
+    заголовок антибиотика, строка «Клиника | <диапазоны…>», затем по строке
+    на клинику со значениями S%. На каждый блок создаётся своя диаграмма
+    BarChart с осями категорий (микроорганизм/материал) и сериями-клиниками.
+    """
+    from openpyxl.chart import BarChart, Reference
+
+    n_charts = 0
+    r = 1
+    max_row = ws.max_row
+    while r <= max_row:
+        a = ws.cell(row=r, column=1).value
+        b = ws.cell(row=r + 1, column=1).value if r + 1 <= max_row else None
+        if a and b == 'Клиника':
+            header_row = r + 1
+            rr = r + 2
+            last_data = rr - 1
+            while last_data + 1 <= max_row:
+                v = ws.cell(row=last_data + 1, column=1).value
+                if v in (None, ''):
+                    break
+                last_data += 1
+            ncols = ws.max_column
+            if last_data >= header_row + 1 and ncols >= 2:
+                chart = BarChart()
+                chart.type = "col"
+                chart.grouping = "clustered"
+                chart.title = str(a)
+                chart.y_axis.title = 'Чувствительность, %'
+                chart.x_axis.title = 'Микроорганизм / материал'
+                data = Reference(ws, min_col=2, max_col=ncols,
+                                 min_row=header_row, max_row=last_data)
+                cats = Reference(ws, min_col=2, max_col=ncols,
+                                 min_row=header_row, max_row=header_row)
+                chart.add_data(data, titles_from_data=False, from_rows=True)
+                chart.set_categories(cats)
+                # имена серий — из первого столбца блока
+                series_names = []
+                for sr in range(header_row + 1, last_data + 1):
+                    v = ws.cell(row=sr, column=1).value
+                    series_names.append(str(v) if v not in (None, '') else f"Ряд {len(series_names)+1}")
+                for s, nm in zip(chart.series, series_names):
+                    from openpyxl.chart.series import SeriesLabel
+                    from openpyxl.chart.data_source import StrRef
+                    s.tx = SeriesLabel(v=nm)
+                chart.width = 32
+                chart.height = 12
+                anchor_col = 1
+                anchor_row = last_data + 2 + n_charts * 1
+                ws.add_chart(chart, f"{get_column_letter(anchor_col)}{anchor_row}")
+                n_charts += 1
+                if n_charts >= COMPARE_CHART_MAX_BLOCKS:
+                    break
+                r = last_data + 2
+                continue
+            r = last_data + 2
+        else:
+            r += 1
+    if log_func and n_charts:
+        log_func(f"Лист «{ws.title}»: добавлено графиков сравнения — {n_charts}.")
+
+
+def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets,
+                   base_sheets=True):
     """Современное оформление книги: шапки, зебра, числовые форматы, панели.
 
     extra_sheets — имена дополнительных листов (конструктор, «Сводка», «Данные»),
-    оформляемых как простые таблицы с шапкой."""
+    оформляемых как простые таблицы с шапкой. base_sheets=False — режим
+    сравнения клиник: базовые листы 1–3 отсутствуют, но листы-блоки сравнения
+    («Антибиотик: …» / «Клиника: …») оформляются по тому же шаблону."""
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.formatting.rule import CellIsRule
     from openpyxl.utils import get_column_letter as gcl
@@ -1852,8 +2101,11 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets):
             ws.column_dimensions[gcl(col)].width = min(length + 2.5, max_width)
 
     # --- Сводка / Данные / листы конструктора / лист 1: простые таблицы ------
-    simple_with_header = [s for s in (['Сводка', 'Данные'] + list(extra_sheets) + ['1'])
-                          if s in writer.sheets]
+    block_sheet_names = {n for n in extra_sheets
+                         if n in writer.sheets and _sheet_has_blocks(writer.sheets[n])}
+    simple_with_header = [s for s in (['Сводка', 'Данные'] + list(extra_sheets) +
+                                      (['1'] if base_sheets else []))
+                          if s in writer.sheets and s not in block_sheet_names]
     for name in simple_with_header:
         ws = writer.sheets[name]
         ncols = ws.max_column
@@ -1926,9 +2178,12 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets):
                 r += 1
         autofit(ws)
 
-    # --- Лист «3»: блоки «Антибиотик: ...» --------
-    for name, block_df in (('3', sheet4_df),):
-        if name not in writer.sheets or block_df is None or block_df.empty:
+    # --- Лист «3» и листы сравнения клиник: блоки «Антибиотик: ...» -----
+    block_names = ['3'] + sorted(block_sheet_names)
+    for name in block_names:
+        if name not in writer.sheets:
+            continue
+        if name == '3' and (sheet4_df is None or sheet4_df.empty):
             continue
         ws = writer.sheets[name]
         ncols = ws.max_column
