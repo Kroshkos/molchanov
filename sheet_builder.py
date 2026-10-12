@@ -24,10 +24,14 @@ import customtkinter as ctk
 from app_core import (
     GROUP_FIELDS, METRIC_OPTIONS, FILTER_OPTIONS, validate_spec,
     save_sheet_specs, load_sheet_specs, SHEET_TEMPLATES, TOTAL_GROUP_KEY,
-    AB_ALL_KEY, AB_ALL_LABEL,
+    AB_ALL_KEY, AB_ALL_LABEL, COMPARE_CLINICS_KEY,
 )
 
 ACCENT = "#2CC98F"
+
+#: Пункт режима карточки: обычный лист или сравнение клиник
+MODE_NORMAL_LABEL = "Обычный лист (группировка и метрики)"
+MODE_COMPARE_LABEL = "⚖️ Сравнение клиник (АБГ по разным клиникам)"
 
 
 class SheetCard(ctk.CTkFrame):
@@ -41,6 +45,7 @@ class SheetCard(ctk.CTkFrame):
         self._suppress_cb_logic = False  # защита от рекурсии при программной установке
 
         spec = spec or {}
+        self._compare_mode = spec.get("mode") == COMPARE_CLINICS_KEY
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(10, 2))
         ctk.CTkLabel(header, text=f"🧩  Лист {index + 1}",
@@ -53,22 +58,31 @@ class SheetCard(ctk.CTkFrame):
         body.pack(fill="x", padx=12, pady=(2, 12))
         body.columnconfigure(1, weight=1)
 
+        # Режим листа: обычный или сравнение клиник
+        self.mode_menu = ctk.CTkOptionMenu(
+            body, values=[MODE_NORMAL_LABEL, MODE_COMPARE_LABEL], width=340,
+            command=self._on_mode_changed)
+        self.mode_menu.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        self.mode_menu.set(MODE_COMPARE_LABEL if self._compare_mode else MODE_NORMAL_LABEL)
+
         # Название листа
         ctk.CTkLabel(body, text="Название:", font=ctk.CTkFont(size=12)).grid(
-            row=0, column=0, sticky="w", pady=4, padx=(0, 8))
+            row=1, column=0, sticky="w", pady=4, padx=(0, 8))
         self.name_var = ctk.StringVar(value=spec.get("name", f"Лист {index + 1}"))
         ctk.CTkEntry(body, textvariable=self.name_var, width=220).grid(
-            row=0, column=1, columnspan=3, sticky="ew", pady=4)
+            row=1, column=1, columnspan=3, sticky="ew", pady=4)
 
         # Группировка (несколько чекбоксов; «Всё вместе» — эксклюзивный режим)
-        ctk.CTkLabel(body, text="Группировать по:\n(можно выбирать несколько)",
-                     font=ctk.CTkFont(size=12), justify="left").grid(
-            row=1, column=0, sticky="nw", pady=(8, 4), padx=(0, 8))
+        self.grp_label = ctk.CTkLabel(body, text="",
+                                      font=ctk.CTkFont(size=12), justify="left")
+        self.grp_label.grid(row=2, column=0, sticky="nw", pady=(8, 4), padx=(0, 8))
         grp_frame = ctk.CTkFrame(body, fg_color="transparent")
-        grp_frame.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 2))
+        grp_frame.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 2))
         self.group_vars = {}
-        chosen_groups = set(spec.get("groups", []))
+        chosen_groups = set(spec.get("compare_by" if self._compare_mode else "groups", []))
         if not spec:
+            chosen_groups = {"organism"}
+        elif self._compare_mode and not chosen_groups:
             chosen_groups = {"organism"}
         for i, (key, label) in enumerate(GROUP_FIELDS):
             var = ctk.BooleanVar(value=key in chosen_groups)
@@ -84,10 +98,11 @@ class SheetCard(ctk.CTkFrame):
         self._update_group_hint()
 
         # Метрики
-        ctk.CTkLabel(body, text="Метрики:", font=ctk.CTkFont(size=12)).grid(
-            row=2, column=0, sticky="nw", pady=(8, 4), padx=(0, 8))
+        self.met_label = ctk.CTkLabel(body, text="Метрики:", font=ctk.CTkFont(size=12))
+        self.met_label.grid(row=3, column=0, sticky="nw", pady=(8, 4), padx=(0, 8))
         met_frame = ctk.CTkFrame(body, fg_color="transparent")
-        met_frame.grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 2))
+        met_frame.grid(row=3, column=1, columnspan=3, sticky="w", pady=(8, 2))
+        self.met_frame = met_frame
         self.metric_vars = {}
         chosen_metrics = set(spec.get("metrics", []))
         if not spec:
@@ -98,25 +113,25 @@ class SheetCard(ctk.CTkFrame):
                             font=ctk.CTkFont(size=12)).grid(
                 row=i // 2, column=i % 2, sticky="w", padx=(0, 16), pady=2)
             self.metric_vars[key] = var
-        self.ab_var = ctk.BooleanVar(value="ab" in chosen_metrics)
+        self.ab_var = ctk.BooleanVar(value="ab" in chosen_metrics or self._compare_mode)
         ab_row = (len(METRIC_OPTIONS) // 2)
-        ctk.CTkCheckBox(met_frame, text="Антибиотикограмма (S/I/R/НД)",
-                        variable=self.ab_var, font=ctk.CTkFont(size=12)).grid(
-            row=ab_row, column=0, columnspan=2, sticky="w", pady=2)
+        self.ab_cb = ctk.CTkCheckBox(met_frame, text="Антибиотикограмма (S/I/R/НД)",
+                                     variable=self.ab_var, font=ctk.CTkFont(size=12))
+        self.ab_cb.grid(row=ab_row, column=0, columnspan=2, sticky="w", pady=2)
 
         # Антибиотик + фильтр (одна строка, элементы растягиваются по ширине)
-        row3 = ctk.CTkFrame(body, fg_color="transparent")
-        row3.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        row3.columnconfigure(1, weight=1)
-        row3.columnconfigure(3, weight=1)
-        ctk.CTkLabel(row3, text="Антибиотик:", font=ctk.CTkFont(size=12)).grid(
-            row=0, column=0, sticky="w", padx=(0, 6))
-        self.antibiotic_menu = ctk.CTkOptionMenu(row3, values=["—"])
+        row4 = ctk.CTkFrame(body, fg_color="transparent")
+        row4.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        row4.columnconfigure(1, weight=1)
+        row4.columnconfigure(3, weight=1)
+        self.ab_title = ctk.CTkLabel(row4, text="Антибиотик:", font=ctk.CTkFont(size=12))
+        self.ab_title.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.antibiotic_menu = ctk.CTkOptionMenu(row4, values=["—"])
         self.antibiotic_menu.grid(row=0, column=1, sticky="ew", padx=(0, 18))
-        ctk.CTkLabel(row3, text="Фильтр:", font=ctk.CTkFont(size=12)).grid(
+        ctk.CTkLabel(row4, text="Фильтр:", font=ctk.CTkFont(size=12)).grid(
             row=0, column=2, sticky="w", padx=(0, 6))
         self.filter_menu = ctk.CTkOptionMenu(
-            row3, values=[label for _, label in FILTER_OPTIONS])
+            row4, values=[label for _, label in FILTER_OPTIONS])
         self.filter_menu.grid(row=0, column=3, sticky="ew")
 
         # восстановление выбранных антибиотика/фильтра
@@ -134,8 +149,47 @@ class SheetCard(ctk.CTkFrame):
         # В Tk режим трассировки называется "write" (а не "changed") — иначе
         # создание карточки падало с TclError и кнопка «Добавить лист» не работала.
         self.ab_var.trace_add("write", lambda *_: self._refresh_antibiotics())
+        self._apply_mode_layout()
 
     # ------------------------------------------------------------------
+    def _is_compare(self):
+        return bool(getattr(self, "_compare_mode", False))
+
+    def _on_mode_changed(self, choice):
+        """Переключение режима карточки: обычный лист / сравнение клиник."""
+        self._compare_mode = (choice == MODE_COMPARE_LABEL)
+        if self._compare_mode:
+            # в режиме сравнения АБГ обязательна, прочие метрики скрыты
+            self.ab_var.set(True)
+        self._apply_mode_layout()
+        self._update_group_hint()
+
+    def _apply_mode_layout(self):
+        """Скрывает/показывает элементы, неприменимые в режиме сравнения клиник."""
+        try:
+            compare = self._is_compare()
+            self.grp_label.configure(
+                text=("Сравнивать по:\n(микроорганизм, материал…)" if compare
+                      else "Группировать по:\n(можно выбирать несколько)"))
+            self.ab_title.configure(
+                text="Антибиотик для сравнения:" if compare else "Антибиотик:")
+            if compare:
+                self.met_label.grid_remove()
+                self.ab_cb.grid_remove()
+                for v in self.metric_vars.values():
+                    if v.get():
+                        v.set(False)  # скрываем только чекбоксы метрик посева
+                for w in self.met_frame.winfo_children():
+                    if w is not self.ab_cb:
+                        w.grid_remove()
+            else:
+                self.met_label.grid()
+                self.ab_cb.grid()
+                for w in self.met_frame.winfo_children():
+                    w.grid()
+        except Exception:
+            pass
+
     def _on_group_toggled(self):
         """Эксклюзивность «Всё вместе»: при его выборе снимаем прочие поля,
         при выборе прочего — снимаем «Всё вместе»."""
@@ -163,10 +217,16 @@ class SheetCard(ctk.CTkFrame):
         """Показывает итоговую схему группировки прямо под чекбоксами."""
         labels = dict(GROUP_FIELDS)
         chosen = [k for k, v in self.group_vars.items() if v.get()]
+        compare = self._is_compare()
         if not chosen:
-            text = "ℹ️ Группировка не выбрана — лист будет построен как «всё вместе» (итог)."
+            text = ("ℹ️ Поля не выбраны — сравнение будет одной итоговой строкой "
+                    "по всем выделениям." if compare else
+                    "ℹ️ Группировка не выбрана — лист будет построен как «всё вместе» (итог).")
         elif TOTAL_GROUP_KEY in chosen:
             text = "📊 Режим «всё вместе»: одна итоговая строка по всей выборке."
+        elif compare:
+            text = ("⚖️ Сравнение клиник: " + " × ".join(labels[k] for k in chosen) +
+                    " — столбцы S%/I%/R% для каждой клиники в одном листе.")
         else:
             text = "➡️ Схема: " + " × ".join(labels[k] for k in chosen)
         try:
@@ -242,14 +302,17 @@ class SheetCard(ctk.CTkFrame):
         """Программно применяет спецификацию к карточке (для шаблонов)."""
         self._suppress_cb_logic = True
         try:
+            compare = spec.get("mode") == COMPARE_CLINICS_KEY
+            self._compare_mode = compare
+            self.mode_menu.set(MODE_COMPARE_LABEL if compare else MODE_NORMAL_LABEL)
             self.name_var.set(spec.get("name", self.name_var.get()))
-            chosen_groups = set(spec.get("groups", []))
+            chosen_groups = set(spec.get("compare_by" if compare else "groups", []))
             for k, v in self.group_vars.items():
                 v.set(k in chosen_groups)
             chosen_metrics = set(spec.get("metrics", []))
             for k, v in self.metric_vars.items():
-                v.set(k in chosen_metrics)
-            self.ab_var.set("ab" in chosen_metrics)
+                v.set(k in chosen_metrics and not compare)
+            self.ab_var.set("ab" in chosen_metrics or compare)
             ab_val = spec.get("antibiotic", "")
             if ab_val:
                 # обратная совместимость: в старых пресетах «все антибиотики»
@@ -261,6 +324,7 @@ class SheetCard(ctk.CTkFrame):
                 if key == fkey:
                     self.filter_menu.set(label)
                     break
+            self._apply_mode_layout()
         finally:
             self._suppress_cb_logic = False
         self._update_group_hint()
@@ -276,6 +340,16 @@ class SheetCard(ctk.CTkFrame):
             if label == sel_label:
                 filter_key = key
                 break
+        if self._is_compare():
+            return {
+                "name": self.name_var.get().strip(),
+                "groups": [],
+                "compare_by": groups,
+                "metrics": ["ab"],
+                "antibiotic": self._selected_antibiotic(),
+                "filter": filter_key,
+                "mode": COMPARE_CLINICS_KEY,
+            }
         return {
             "name": self.name_var.get().strip(),
             "groups": groups,
