@@ -7,9 +7,11 @@ import customtkinter as ctk
 from tkinter import filedialog
 
 from app_core import (
-    run_pipeline, run_pipeline_multi_clinic, run_clinic_comparison, load_data,
-    get_file_info, detect_clinics, ALL_CLINICS_LABEL, COMPARE_CLINICS_LABEL,
-    COMPARE_CLINICS_KEY, validate_spec, save_compare_preset, load_compare_preset,
+    run_pipeline, run_pipeline_multi_clinic, run_clinic_comparison,
+    get_file_info, count_rows_by_clinic, load_data,
+    ALL_CLINICS_LABEL, COMPARE_CLINICS_LABEL, COMPARE_CLINICS_KEY,
+    DEFAULT_CLINIC_LABEL,
+    save_compare_preset, load_compare_preset,
 )
 from sheet_builder import SheetBuilderDialog
 
@@ -153,9 +155,7 @@ class App(ctk.CTk):
                       fg_color="transparent", border_width=1,
                       command=self._cmp_clear_abs).pack(side="left")
 
-        self.cmp_ab_listbox = ctk.CTkTextbox(self.cmp_ab_frame, height=120,
-                                             wrap="none", activatescrollbars=True)
-        # Tk Listbox внутри CTk-фрейма — многосписочный выбор с Ctrl/Shift
+        # Tk Listbox внутри CTk-фрейма — множественный выбор с Ctrl/Shift
         import tkinter as tk
         self.cmp_ab_lb = tk.Listbox(self.cmp_ab_frame, selectmode="extended",
                                     height=6, exportselection=False,
@@ -271,27 +271,200 @@ class App(ctk.CTk):
                 name, _ = os.path.splitext(basename)
                 stamp = datetime.now().strftime("%Y%m%d_%H%M")
                 self.output_file.set(os.path.join(dirname, f"{name}_обработанный_{stamp}.xlsx"))
-            # фоновое определение антибиотиков — чтобы конструктор сразу знал список
+            # фоновое определение клиник и антибиотиков — чтобы конструктор и
+            # режим «Сравнение клиник» сразу знали списки
             self._antibiotics_cache = []
-            threading.Thread(target=self._scan_antibiotics, args=(filename,),
+            self._clinics_cache = []
+            self._populate_clinics([])
+            self._scan_token += 1
+            token = self._scan_token
+            threading.Thread(target=self._scan_antibiotics, args=(filename, token),
                              daemon=True).start()
 
-    def _scan_antibiotics(self, path):
+    def _scan_antibiotics(self, path, token=None):
         try:
-            _, _, _, antibiotics, _ = load_data(path, log_func=None)
+            clinics, antibiotics = get_file_info(path, log_func=None)
+            if token is not None and token != self._scan_token:
+                return  # пользователь уже выбрал другой файл
             self._antibiotics_cache = list(antibiotics)
+            self._clinics_cache = list(clinics)
+            counts = {}
+            try:
+                _, _, data, _, _ = load_data(path, log_func=None)
+                counts = count_rows_by_clinic(data)
+            except Exception:
+                pass
+            self._log_queue.put(f"Найдено клиник: {len(clinics)} "
+                                f"({', '.join(clinics) if clinics else '—'}).")
             self._log_queue.put(f"Список антибиотиков обновлён: {len(antibiotics)} шт. "
-                                f"(для конструктора листов)")
+                                f"(для конструктора листов и сравнения клиник)")
+            # обновление виджетов — в главном потоке
+            self.after(0, lambda: self._populate_clinics(clinics, counts))
         except Exception as e:
             self._antibiotics_cache = []
-            self._log_queue.put(f"Не удалось заранее прочитать антибиотики: {e}")
+            self._clinics_cache = []
+            self._log_queue.put(f"Не удалось заранее прочитать файл: {e}")
+
+    # ------------------------------------------------------------------
+    # Режим «Сравнение клиник» (отдельный режим работы)
+    # ------------------------------------------------------------------
+    def _is_compare_mode(self):
+        return self.clinic_menu.get() == COMPARE_CLINICS_LABEL
+
+    def _on_clinic_mode_changed(self, choice):
+        """Переключение видимости панели сравнения + подсказки о режиме."""
+        compare = choice == COMPARE_CLINICS_LABEL
+        if compare:
+            self.compare_frame.grid()
+            self.builder_btn.configure(state="disabled")
+            self.builder_info.configure(
+                text="режим «Сравнение клиник»: базовые листы не создаются")
+        else:
+            self.compare_frame.grid_remove()
+            self.builder_btn.configure(state="normal")
+            n = len(self._sheet_specs)
+            self.builder_info.configure(text=f"доп. листов: {n}")
+        self._update_cmp_info()
+
+    def _populate_clinics(self, clinics, counts=None):
+        """Чекбоксы клиник из исходного файла (при выборе — все отмечены)."""
+        for cb in self._clinic_checkboxes.values():
+            cb.destroy()
+        self._clinic_vars.clear()
+        self._clinic_checkboxes.clear()
+        if not clinics:
+            self._clinics_placeholder.grid(row=0, column=0, sticky="w")
+            self._update_cmp_info()
+            return
+        self._clinics_placeholder.grid_forget()
+        counts = counts or {}
+        import tkinter as tk
+        for i, cl in enumerate(clinics):
+            var = tk.BooleanVar(master=self, value=True)
+            n = counts.get(cl)
+            label = f"{cl} ({n} посевов)" if n else cl
+            cb = ctk.CTkCheckBox(self.cmp_clinic_box, text=label, variable=var,
+                                 font=ctk.CTkFont(size=13),
+                                 command=self._update_cmp_info)
+            cb.grid(row=0, column=i, padx=(0, 18), pady=2)
+            self._clinic_vars[cl] = var
+            self._clinic_checkboxes[cl] = cb
+        self._update_cmp_info()
+
+    def selected_clinics(self):
+        return [cl for cl, v in self._clinic_vars.items() if v.get()]
+
+    def selected_compare_antibiotics(self):
+        sel = []
+        for i in self.cmp_ab_lb.curselection():
+            try:
+                sel.append(self.cmp_ab_lb.get(i))
+            except Exception:
+                pass
+        return sel
+
+    def _refilter_cmp_antibiotics(self):
+        """Фильтрация списка антибиотиков по строке поиска (выбор сохраняется)."""
+        chosen = set(self.selected_compare_antibiotics())
+        query = self.cmp_search_var.get().strip().lower()
+        self.cmp_ab_lb.delete(0, "end")
+        shown = 0
+        for ab in self._antibiotics_cache:
+            if query and query not in ab.lower():
+                continue
+            self.cmp_ab_lb.insert("end", ab)
+            if ab in chosen:
+                self.cmp_ab_lb.selection_set(shown)
+            shown += 1
+        self._update_cmp_info()
+
+    def _cmp_select_all_abs(self):
+        query = self.cmp_search_var.get().strip().lower()
+        self.cmp_ab_lb.select_clear(0, "end")
+        for i, ab in enumerate(self.cmp_ab_lb.get(0, "end")):
+            if not query or query in ab.lower():
+                self.cmp_ab_lb.selection_set(i)
+        self._update_cmp_info()
+
+    def _cmp_clear_abs(self):
+        self.cmp_ab_lb.select_clear(0, "end")
+        self._update_cmp_info()
+
+    def _update_cmp_info(self):
+        if not self._is_compare_mode():
+            self.cmp_info.configure(text="")
+            return
+        n_abs = len(self.selected_compare_antibiotics())
+        total_abs = len(self._antibiotics_cache)
+        abs_txt = (f"антибиотики: все ({total_abs})" if n_abs == 0
+                   else f"антибиотики: выбрано {n_abs} из {total_abs}")
+        cl = self.selected_clinics()
+        cl_txt = f"клиники: {', '.join(cl) if cl else 'не отмечены'}"
+        warn = ""
+        if self._clinics_cache and len(cl) < 2:
+            warn = "  ⚠️ отметьте минимум две клиники"
+        self.cmp_info.configure(text=f"ℹ️ {abs_txt};  {cl_txt}{warn}")
+
+    def _build_compare_spec(self):
+        """Спецификация листа для отдельного режима «Сравнение клиник»."""
+        return {
+            "name": "Сравнение клиник",
+            "mode": COMPARE_CLINICS_KEY,
+            "clinics": self.selected_clinics(),
+            "antibiotics": self.selected_compare_antibiotics(),
+            "compare_by": ["organism", "material_raw"],
+            "filter": "positive_only",
+        }
+
+    def _save_compare_settings(self):
+        path = filedialog.asksaveasfilename(
+            title="Сохранить настройки сравнения",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            save_compare_preset(self._build_compare_spec(), path)
+            self.log(f"Настройки сравнения сохранены: {path}")
+        except Exception as e:
+            self._error(f"Не удалось сохранить настройки: {e}")
+
+    def _load_compare_settings(self):
+        path = filedialog.askopenfilename(
+            title="Загрузить настройки сравнения",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            spec = load_compare_preset(path)
+        except Exception as e:
+            self._error(f"Не удалось загрузить настройки: {e}")
+            return
+        # антибиотики: отметить в списке только сохранённые (если они есть в файле)
+        wanted = set(spec.get("antibiotics") or [])
+        self.cmp_ab_lb.select_clear(0, "end")
+        if wanted:
+            for i, ab in enumerate(self.cmp_ab_lb.get(0, "end")):
+                if ab in wanted:
+                    self.cmp_ab_lb.selection_set(i)
+        # клиники: отметить сохранённые (если они есть в текущем файле)
+        saved_clinics = spec.get("clinics") or []
+        known = [c for c in saved_clinics if c in self._clinic_vars]
+        if known:
+            for cl, var in self._clinic_vars.items():
+                var.set(cl in set(known))
+        self._update_cmp_info()
+        self.log(f"Настройки сравнения загружены: {os.path.basename(path)}"
+                 + ("" if known else " (клиники из пресета не найдены в текущем файле — "
+                                     "будут использованы все клиники файла)"))
 
     # ------------------------------------------------------------------
     # Конструктор дополнительных листов
     # ------------------------------------------------------------------
     def open_sheet_builder(self):
         dlg = SheetBuilderDialog(self,
-                                 antibiotics_getter=lambda: self._antibiotics_cache)
+                                 antibiotics_getter=lambda: self._antibiotics_cache,
+                                 clinics_getter=lambda: self._clinics_cache)
         dlg.wait_window()
         if dlg.specs is not None:  # нажата кнопка «Применить»
             self._sheet_specs = dlg.specs
@@ -347,7 +520,22 @@ class App(ctk.CTk):
             return
 
         styled = bool(self.styled_var.get())
-        specs = list(self._sheet_specs)
+        compare_mode = self._is_compare_mode()
+        specs = [] if compare_mode else list(self._sheet_specs)
+
+        if compare_mode:
+            # отдельный режим «Сравнение клиник»: клиники чекбоксами,
+            # антибиотики списком (пусто = все); базовые листы не создаются
+            clinics_sel = self.selected_clinics()
+            if len(clinics_sel) < 2:
+                self._error("В режиме «Сравнение клиник» отметьте минимум две клиники "
+                            "(чекбоксы под выбором файла).")
+                return
+            spec = self._build_compare_spec()
+            mode_txt = COMPARE_CLINICS_LABEL
+        else:
+            spec = None
+            mode_txt = self.clinic_menu.get()
 
         self._processing = True
         self.run_btn.configure(state="disabled", text="Обработка…", fg_color="gray45")
@@ -356,21 +544,52 @@ class App(ctk.CTk):
         self.log_area.configure(state="disabled")
         self.progress.start()
         self.log("Начало обработки...")
-        if specs:
-            self.log(f"План: 3 базовых листа + {len(specs)} из конструктора: "
-                     + ", ".join(s['name'] for s in specs))
+
+        if compare_mode:
+            self.log(f"Режим: {COMPARE_CLINICS_LABEL}. "
+                     f"Клиники: {', '.join(spec['clinics'])}. "
+                     f"Антибиотики: "
+                     + (f"все ({len(self._antibiotics_cache)})" if not spec['antibiotics']
+                        else ", ".join(spec['antibiotics']))
+                     + ". Базовые листы 1–3 не создаются.")
+        else:
+            self.log(f"Клиника: {mode_txt}")
+            if specs:
+                self.log(f"План: 3 базовых листа + {len(specs)} из конструктора: "
+                         + ", ".join(s['name'] for s in specs))
 
         thread = threading.Thread(target=self._task,
-                                  args=(input_path, output_path, styled, specs),
+                                  args=(input_path, output_path, styled, specs,
+                                        mode_txt, compare_mode, spec),
                                   daemon=True)
         thread.start()
 
-    def _task(self, input_path, output_path, styled, specs):
+    def _task(self, input_path, output_path, styled, specs, mode_txt,
+              compare_mode=False, compare_spec=None):
         # Из фонового потока не трогаем Tk напрямую — только очередь и флаг.
         try:
-            run_pipeline(input_path, output_path, styled=styled, log_func=self.log,
-                         extra_sheets=specs)
-            self._log_queue.put(f"Результат сохранён: {output_path}")
+            if compare_mode:
+                built = run_clinic_comparison(input_path, output_path, compare_spec,
+                                              styled=styled, log_func=self.log)
+                names = ", ".join(built.keys())
+                self._log_queue.put(f"Результат сохранён: {output_path} "
+                                    f"(листы: {names})")
+            elif mode_txt == ALL_CLINICS_LABEL:
+                results = run_pipeline_multi_clinic(
+                    input_path, output_path, styled=styled, log_func=self.log,
+                    extra_sheets=specs)
+                listing = "; ".join(f"{cl}: {os.path.basename(p)}"
+                                    for cl, p in results.items())
+                self._log_queue.put(f"Создано файлов: {len(results)} — {listing}")
+            else:
+                # выбранная клиника из меню; если её нет в файле (например,
+                # «Общая выборка») — обычная обработка всего файла
+                clinic = None if mode_txt in (ALL_CLINICS_LABEL, DEFAULT_CLINIC_LABEL) \
+                    else mode_txt
+                run_pipeline(input_path, output_path, styled=styled,
+                             log_func=self.log, extra_sheets=specs,
+                             clinic=clinic)
+                self._log_queue.put(f"Результат сохранён: {output_path}")
             self._finished_ok = True
         except Exception as e:
             self._log_queue.put(f"ОШИБКА: {e}")

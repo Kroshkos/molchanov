@@ -1502,7 +1502,9 @@ def _cmp_block_stats(sub, data, col_lab, row_fields, combos):
     tmp = pd.DataFrame({'_rsi': rsi_src.apply(_rsi)})
     if row_fields:
         for f in row_fields:
-            tmp[f] = sub[f].values
+            # берём значения по индексам (а не .values): pos может быть вырезан
+            # из base_df, индексы строк которого не совпадают с data
+            tmp[f] = sub[f].reindex(tmp.index).fillna('').astype(str).str.strip().values
         counts = tmp.groupby(row_fields + ['_rsi']).size().unstack('_rsi', fill_value=0)
         if isinstance(counts.index, pd.MultiIndex):
             counts = counts.reset_index()
