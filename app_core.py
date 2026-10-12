@@ -1875,6 +1875,10 @@ def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=N
     # если ни одна не совпала — сравниваем все найденные клиники
     known = _clinic_codes(data)
     valid_clinics = [c for c in (spec.get('clinics') or []) if c in known]
+    # если отмеченных клиник нет/не совпало, но в файле есть хотя бы две —
+    # сравниваем все клиники файла (fallback для режима «Все клиники»)
+    if len(valid_clinics) < 2 and len(known) >= 2:
+        valid_clinics = list(known)
     spec = dict(spec)
     spec['clinics'] = valid_clinics
     errs = validate_spec(spec, available_antibiotics=antibiotics)
