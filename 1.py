@@ -327,7 +327,15 @@ class App(ctk.CTk):
         self._update_cmp_info()
 
     def _populate_clinics(self, clinics, counts=None):
-        """Чекбоксы клиник из исходного файла (при выборе — все отмечены)."""
+        """Меню режимов + чекбоксы клиник из исходного файла (все отмечены)."""
+        # обновляем выпадающий список режимов: Все клиники | клиники | Сравнение
+        menu_values = [ALL_CLINICS_LABEL] + list(clinics) + [COMPARE_CLINICS_LABEL]
+        self.clinic_menu.configure(values=menu_values)
+        cur = self.clinic_menu.get()
+        if cur not in menu_values:  # клиника из прежнего файла исчезла — сброс
+            self.clinic_menu.set(ALL_CLINICS_LABEL)
+            self._on_clinic_mode_changed(ALL_CLINICS_LABEL)
+
         for cb in self._clinic_checkboxes.values():
             cb.destroy()
         self._clinic_vars.clear()
