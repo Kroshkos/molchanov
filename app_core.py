@@ -1455,23 +1455,42 @@ def filter_data_by_clinic(data, antibiotics, ab_indices, clinic):
 #: Пункт выбора клиники на главном окне: отдельный режим «Сравнение клиник»
 COMPARE_CLINICS_LABEL = '⚖️ Сравнение клиник'
 
-#: Порог значимости отключён: в листы сравнения попадают все значения S%,
-#: полученные хотя бы на одном определении (S+I+R ≥ 1). Число определений
-#: всегда указывается рядом со значением («42.9% (n=3)»), чтобы читатель сам
-#: оценивал надёжность цифры.
-CMP_MIN_SIGNIFICANT = 1
+#: Минимальное число ОПРЕДЕЛЁННЫХ ответов (S+I+R), ниже которого доля S%
+#: считается статистически незначимой и в листы сравнения (матрицу,
+#: топы различий, графики) не попадает. Порог относится ТОЛЬКО к режиму
+#: «Сравнение клиник» — базовые листы 1–3 считаются по исходным правилам
+#: без всяких порогов.
+CMP_MIN_SIGNIFICANT = 5
 
 
 def _s_pct_of_defined(s, i, r):
     """Доля чувствительных среди ОПРЕДЕЛЁННЫХ ответов (S+I+R).
 
-    Именно так считается чувствительность в антибиотикограммах: строки,
-    где антибиотик не испытывался (пусто / только MIC / «нет роста»),
-    в знаменатель не входят — иначе S% искусственно занижается до 1–3%
-    и сравнение клиник теряет смысл.
+    Используется только в режиме «Сравнение клиник»: строки, где
+    антибиотик не испытывался (пусто / только MIC / «нет роста»),
+    в знаменатель не входят — иначе S% искусственно занижается до
+    1–3% и сравнение клиник теряет смысл.
     """
     det = s + i + r
     return round(s / det * 100, 1) if det else None
+
+
+def _cmp_pct_cols(ws, hdr_row):
+    """Процентные столбцы шапки блока: col -> ('S'|'I'|'R'|'ND'|'n').
+
+    Колонка «n» (число определений S+I+R) обрабатывается как отдельный
+    тип: она не заливается тепловой шкалой, а только помечается серым,
+    если n ниже порога значимости CMP_MIN_SIGNIFICANT.
+    """
+    pct_names = {'S%': 'S', 'I%': 'I', 'R%': 'R', 'НД%': 'ND'}
+    cols = {}
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(row=hdr_row, column=c).value
+        if h in pct_names:
+            cols[c] = pct_names[h]
+        elif h == 'n':
+            cols[c] = 'n'
+    return cols
 
 
 def get_compare_sheet_names(spec_name):
@@ -1527,16 +1546,17 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
     """Считает строки блока (клиника × антибиотик) в формате листа 3.
 
     Возвращает (rows_out, total_row, chart_items, labels_out):
-      rows_out    — строки [ключ группы..., S, I, R, НД, Total, n, S%, I%, R%];
+      rows_out    — строки [ключ группы..., S, I, R, НД, Total, n,
+                            S%, I%, R%];
       total_row   — итоговая строка «ВСЕГО» в том же формате;
-      chart_items — [(подпись, S%, n)] для всех строк с определениями
-                    (S+I+R ≥ CMP_MIN_SIGNIFICANT, порог = 1);
+      chart_items — [(подпись, S%, n)] для значимых строк
+                    (n ≥ CMP_MIN_SIGNIFICANT);
       labels_out  — все подписи строк блока (для матрицы).
-    Проценты считаются так же, как в базовых листах программы: по
-    ОПРЕДЕЛЁННЫМ ответам (S+I+R), без «НД» в знаменателе — строки, где
-    антибиотик не испытывался, занижали бы чувствительность до единиц
-    процентов. Столбец «n» показывает, из скольких определений получен
-    процент (колонка «НД%» заменена на «n», т.к. НД = Total − n).
+    Проценты считаются по ОПРЕДЕЛЁННЫМ ответам (S+I+R), без «НД» в
+    знаменателе — строки, где антибиотик не испытывался, занижали бы
+    чувствительность до единиц процентов. Столбец «n» показывает, из
+    скольких определений получен процент (колонка «НД%» заменена на «n»,
+    т.к. НД = Total − n).
     Строки сортируются по общему списку комбинаций (combos), поэтому блоки
     разных клиник содержат одинаковые наборы «микроорганизм × материал»
     в одном порядке — сравнение визуально сопоставимо.
@@ -1545,7 +1565,7 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
         if isinstance(v, str):
             s = v.strip().upper()
             return s if s in AB_METRICS else 'НД'
-        return 'НД'  # пусто / NaN / число MIC — определяемость не установлена
+        return 'НД'  # пусто / NaN / число MIC — ответ не получен (НД)
 
     # Колонку берём по позиции: в исходных файлах заголовки «RSI»/«MIC»
     # повторяются, выбор по метке вернул бы не ту колонку (или Series из
@@ -1596,8 +1616,8 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
         rows_out.append(list(key) + vals)
         lbl = ' | '.join(key) if row_fields else 'Все данные'
         labels_out.append(lbl)
-        # в графики и сравнения — все строки, где есть хотя бы одно
-        # определение S/I/R (порог значимости отключён, n виден в подписи)
+        # в графики и значимые сравнения — только строки с достаточным числом
+        # определений (иначе процент получен на 1–4 изолятах и несопоставим)
         if vals[5] >= CMP_MIN_SIGNIFICANT and vals[6] is not None:
             chart_items.append((lbl, vals[6], vals[5]))
     if not rows_out:
@@ -1695,7 +1715,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             if not rows_out:
                 continue
             blocks.append((ab, cl, rows_out, total_row))
-            # строки с определениями (n ≥ CMP_MIN_SIGNIFICANT) — для матрицы и графиков
+            # значимые строки (n ≥ CMP_MIN_SIGNIFICANT) — для матрицы и графиков
             chart_data.append((ab, cl, list(chart_items)))
             for lbl, row_vals in zip(labels_out, rows_out):
                 # Числовые столбцы строки блока после ключей:
@@ -1744,16 +1764,16 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
 
     # --- лист «матрица»: один экран на весь набор сравнения ---
     # Строки: Антибиотик × микроорганизм/материал; колонки: клиники (S%).
-    # S% считается по ОПРЕДЕЛЁННЫМ ответам (S+I+R); в матрицу попадают ВСЕ
-    # значения, полученные хотя бы на одном определении (порог значимости
-    # отключён: CMP_MIN_SIGNIFICANT = 1). Ячейки окрашиваются по цветовой
-    # шкале чувствительности (см. _style_compare_matrix).
+    # S% считается по ОПРЕДЕЛЁННЫМ ответам (S+I+R); в матрицу попадают только
+    # значимые ячейки — с n ≥ CMP_MIN_SIGNIFICANT. Ячейки окрашиваются по
+    # цветовой шкале чувствительности (см. _style_compare_matrix).
     # Статусы ячеек:
-    #   «42.9% (n=14)» — значение и число определений, из которых оно получено
-    #                    (надёжность цифры читатель оценивает по n);
-    #   «нет теста»    — посевы были, но антибиотик этой паре не назначался;
+    #   «42.9% (n=14)» — значение и число определений, из которых оно получено;
+    #   «нет теста»    — посевы были, но антибиотик этой паре не назначался
+    #                    либо определений меньше порога значимости (значения
+    #                    на 1–4 изолятах в сравнении не показываем);
     #   «нет посевов»  — у клиники нет проб с этим микроорганизмом/материалом.
-    s_map = {}          # (ab, label) -> {clinic: (S%, n)} — все значения с n≥1
+    s_map = {}          # (ab, label) -> {clinic: (S%, n)} — только значимые
     n_map = {}          # (ab, label) -> {clinic: получено ответов (S+I+R+НД)}
     d_map = {}          # (ab, label) -> {clinic: определённых ответов (S+I+R)}
     for ab, cl, items in chart_data:
@@ -1780,7 +1800,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     used_statuses = set()
     for ab in selected_abs:
         # в матрицу попадают только наборы «микроорганизм / материал», по которым
-        # ХОТЬ ОДНА клиника получила значение S% (хотя бы 1 определение).
+        # ХОТЬ ОДНА клиника получила ЗНАЧИМОЕ значение S% (n ≥ порога).
         # Строки, где не было бы ни одного значения (везде «нет посевов» /
         # «нет теста»), из таблицы исключаются.
         labels_ab = sorted(lbl for (a, lbl) in s_map if a == ab)
@@ -1810,7 +1830,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
                 else:
                     best_worst = "равно"
             elif len(tested) == 1:
-                best_worst = "данные только у одной клиники"
+                best_worst = "значимые данные только у одной клиники"
             row_vals = []
             for cl in clinics:
                 txt, status = _cell_status(ab, lbl, cl)
@@ -1849,10 +1869,9 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     # --- лист с графиками: S% по клиникам для одних и тех же наборов ---
     # Простые сравнимые графики: ОДИН график на антибиотик, категории —
     # микроорганизмы (материал вынесен в подпись), серии — клиники.
-    # В график попадают все значения с хотя бы одним определением
-    # (n ≥ CMP_MIN_SIGNIFICANT, порог = 1): если у клиники по микроорганизму
-    # данных нет, столбец просто не рисуется (None), а не подставляется
-    # ложный «0%».
+    # В график попадают ТОЛЬКО значимые значения (n ≥ CMP_MIN_SIGNIFICANT):
+    # если у клиники по микроорганизму данных нет, столбец просто не рисуется
+    # (None), а не подставляется ложный «0%».
     groups = []  # (ab, [orgs], {clinic: [S% or None]}, clinics_in_chart)
     by_ab = {}
     for ab, cl, items in chart_data:
@@ -1893,8 +1912,9 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         chart_df = pd.DataFrame(group_rows)
     else:
         chart_df = pd.DataFrame([[
-            'Графики не построены: для сравнения нужны определения S/I/R '
-            'хотя бы по двум клиникам на один и тот же микроорганизм.']])
+            'Графики не построены: для сравнения нужны значимые данные '
+            f'(не менее {CMP_MIN_SIGNIFICANT} определений S/I/R) хотя бы по двум '
+            'клиникам на один и тот же микроорганизм.']])
 
     if log_func:
         log_func(f"Сравнение клиник «{spec.get('name')}»: {len(selected_abs)} антибиотик(ов), "
@@ -2515,10 +2535,15 @@ def _build_matrix_legend(statuses):
     rows.append(('section', None, 'Обозначения в ячейках:'))
     rows.append(('cell', (f"12.3", None, None),
                  'число — S% чувствительности (доля S от определённых S+I+R)'))
+    rows.append(('cell', ("42.9% (n=14)", None, None),
+                 'n в скобках — число определений (S+I+R), из которых получен %'))
+    rows.append(('cell', ("нет данных", 'F2F2F2', '808080'),
+                 f"мало данных: определений меньше {CMP_MIN_SIGNIFICANT} — значение "
+                 "нестабильно, в сравнение и топ-различий не попадает"))
     if 'no_test' in statuses:
         rows.append(('cell', ("нет теста", 'EDEDED', '808080'),
-                    "у клиники есть посевы этого набора, но данный антибиотик "
-                    "им не испытывался (0 определений S/I/R)"))
+                    "посевы были, но данный антибиотик этой паре не испытывался "
+                    "(или определений меньше порога значимости)"))
     if 'no_cultures' in statuses:
         rows.append(('cell', ("нет посевов", 'FFFFFF', 'A6A6A6'),
                     'у клиники нет проб с таким микроорганизмом/материалом'))
@@ -2536,7 +2561,9 @@ def _build_matrix_legend(statuses):
                  'против клиники с наименьшим S% (n)'))
     rows.append(('line', None,
                  'S% = S / (S + I + R) × 100, где S/I/R — определения по EUCAST; '
-                 'НД (неdefines) из знаменателя исключаются'))
+                 'НД (неопределившие) из знаменателя исключаются; правило '
+                 'относится к листам СРАВНЕНИЯ клиник (в базовых листах «3» '
+                 'проценты считаются от Total = S + I + R + НД)'))
     return rows
 
 
@@ -2544,19 +2571,68 @@ def _highlight_compare_sheet(ws):
     """Тепловое выделение процентов на весь табличный лист сравнения клиник.
 
     В отличие от обычного листа 3 (где подсвечивается только колонка S%),
-    здесь сравниваются клиники, поэтому визуально выделяем все процентные
-    столбцы: S% — по цветовой шкале CMP_SCALES (чем выше чувствительность,
-    тем зеленее), I% / R% / НД% — симметричной шкалой «чем больше, тем
-    хуже» (жёлтый → оранжевый → красный). Выделение применяется ко всем
-    строкам данных всех блоков клиник и к строкам «ВСЕГО».
+    здесь сравниваются клиники, поэтому визуально выделяем ВСЕ процентные
+    столбцы на весь лист — включая сводку «ТОП РАЗЛИЧИЙ»:
+      S%                — цветовая шкала CMP_SCALES (чем выше
+                          чувствительность, тем зеленее);
+      I% / R% / НД%     — шкала «чем больше, тем хуже» (жёлтый →
+                          оранжевый → красный);
+      «Макс. S%»,       — шкала S%;
+      «Мин. S%»
+      «Разница, п.п.»   — чем больше расхождение клиник, тем краснее;
+      n                 — серый при n < CMP_MIN_SIGNIFICANT (мало данных).
+    Выделение применяется ко всем строкам данных всех блоков клиник,
+    строкам «ВСЕГО» и таблице топ-различий внизу листа.
     """
     from openpyxl.styles import Font, PatternFill
     # (порог, заливка, цвет шрифта) для долей «чем больше — тем хуже»
     bad_scales = [(40, 'FFC7CE', '9C0006'),
                   (25, 'FFCC99', '974706'),
                   (15, 'FFEB9C', '9C6500')]
-    r = 1
+    diff_scales = [(30, 'FFC7CE', '9C0006'),
+                   (20, 'FFCC99', '974706'),
+                   (10, 'FFEB9C', '9C6500')]
+
+    def paint(cell, fill_hex, fcolor):
+        if fill_hex:
+            cell.fill = PatternFill(start_color=fill_hex, end_color=fill_hex,
+                                    fill_type='solid')
+        if fcolor:
+            cell.font = Font(color=fcolor, bold=cell.font.bold)
+
     max_row = ws.max_row
+
+    def style_data_rows(start, hdr_by_col):
+        """Заливает процентные ячейки строк блока до конца блока."""
+        rr = start
+        while rr <= max_row:
+            a = ws.cell(row=rr, column=1).value
+            if a in (None, '') or str(a).startswith(('Антибиотик:', 'Клиника:',
+                                                     'ТОП РАЗЛИЧИЙ')):
+                break
+            for c, kind in hdr_by_col.items():
+                cell = ws.cell(row=rr, column=c)
+                val = cell.value
+                if not isinstance(val, (int, float)):
+                    continue
+                fv = float(val)
+                if kind == 'S':
+                    fl, fn = _cmp_heat_style(fv)
+                    paint(cell,
+                          fl.start_color.rgb if fl else None,
+                          getattr(fn.color, 'rgb', None) if fn else None)
+                elif kind == 'n':
+                    if fv < CMP_MIN_SIGNIFICANT:
+                        paint(cell, 'F2F2F2', '808080')
+                else:  # I/R/ND — «чем больше, тем хуже»
+                    for th, fg, fc in bad_scales:
+                        if fv >= th:
+                            paint(cell, fg, fc)
+                            break
+            rr += 1
+        return rr
+
+    r = 1
     while r <= max_row:
         v = ws.cell(row=r, column=1).value
         if v and str(v).startswith('Антибиотик:'):
@@ -2565,40 +2641,40 @@ def _highlight_compare_sheet(ws):
             v2 = ws.cell(row=rr, column=1).value
             if v2 and str(v2).startswith('Клиника:'):
                 rr += 1
-            hdr_row = rr
-            hdr = [ws.cell(row=hdr_row, column=c).value
-                   for c in range(1, ws.max_column + 1)]
-            pct_cols = {}   # col -> имя метрики ('S%', 'I%', ...)
-            for c, h in enumerate(hdr, start=1):
-                if h in {f'{m}%' for m in AB_METRICS}:
-                    pct_cols[c] = h
-            rr += 1
+            rr = style_data_rows(rr + 1, _cmp_pct_cols(ws, rr))
+            r = rr
+            continue
+        if v and str(v).startswith('ТОП РАЗЛИЧИЙ'):
+            hdr_row = r + 1
+            top_cols = {}   # col -> 'S' | 'diff'
+            for c in range(1, ws.max_column + 1):
+                h = ws.cell(row=hdr_row, column=c).value
+                hs = str(h).strip() if h is not None else ''
+                if hs.startswith('Макс. S%') or hs.startswith('Мин. S%'):
+                    top_cols[c] = 'S'
+                elif hs.startswith('Разница'):
+                    top_cols[c] = 'diff'
+            rr = hdr_row + 1
             while rr <= max_row:
                 a = ws.cell(row=rr, column=1).value
-                if a in (None, '') or str(a).startswith(('Антибиотик:', 'Клиника:',
-                                                         'ТОП РАЗЛИЧИЙ')):
+                if a in (None, ''):
                     break
-                for c, metric in pct_cols.items():
+                for c, kind in top_cols.items():
                     cell = ws.cell(row=rr, column=c)
                     val = cell.value
                     if not isinstance(val, (int, float)):
                         continue
                     fv = float(val)
-                    if metric == 'S%':
-                        fill, fnt = _cmp_heat_style(fv)
+                    if kind == 'S':
+                        fl, fn = _cmp_heat_style(fv)
+                        paint(cell,
+                              fl.start_color.rgb if fl else None,
+                              getattr(fn.color, 'rgb', None) if fn else None)
                     else:
-                        fill = fnt = None
-                        for th, fg, fc in bad_scales:
+                        for th, fg, fc in diff_scales:
                             if fv >= th:
-                                fill = PatternFill(start_color=fg, end_color=fg,
-                                                   fill_type='solid')
-                                fnt = Font(color=fc)
+                                paint(cell, fg, fc)
                                 break
-                    if fill:
-                        cell.fill = fill
-                    if fnt:
-                        base_bold = cell.font.bold
-                        cell.font = Font(color=fnt.color, bold=base_bold)
                 rr += 1
             r = rr
             continue
@@ -2933,10 +3009,9 @@ def _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets,
                         if k % 2 == 1:
                             cell.fill = zebra_fill
                     if s_col is None:
-                        for c in range(1, ncols + 1):
-                            if ws.cell(row=hdr_scan, column=c).value == 'S%':
-                                s_col = c
-                                break
+                        s_col = next((cc for cc, kind in
+                                      _cmp_pct_cols(ws, hdr_scan).items()
+                                      if kind == 'S'), None)
                     k += 1
                     rr += 1
                 if s_col and k:
