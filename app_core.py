@@ -461,15 +461,23 @@ def load_data(filepath, log_func=None):
     return df_main, ab_data, data, antibiotics, ab_indices
 
 
-def compute_ab_data(df, antibiotics, ab_indices, group_cols=None, log_func=None):
+def compute_ab_data(df, antibiotics, ab_indices, group_cols=None, min_n=0,
+                    log_func=None):
     """
     Вычисляет статистику по антибиотикам для заданного DataFrame.
     df должен содержать столбец 'organism' и столбцы с RSI-значениями по индексам ab_indices.
     Параметр group_cols задаёт список столбцов для группировки (по умолчанию ['organism']).
     Возвращает словарь ab_data {антибиотик: DataFrame с подсчётами}.
+
+    min_n — порог значимости: строки, где число ОПРЕДЕЛЁННЫХ ответов
+    (S+I+R) меньше min_n, из таблицы исключаются (0 = без порога, как по
+    умолчанию во всех базовых режимах). Значение S% считается от всех
+    проб с ростом (Total = S+I+R+НД), как и раньше; дополнительно
+    возвращается колонка «n» — число определённых ответов (S+I+R).
     """
     if group_cols is None:
         group_cols = ['organism']
+    min_n = max(int(min_n or 0), 0)
 
     ab_records = {ab: [] for ab in antibiotics}
     for idx, row in df[df['is_positive']].iterrows():
@@ -500,6 +508,9 @@ def compute_ab_data(df, antibiotics, ab_indices, group_cols=None, log_func=None)
                     counts[col] = 0
             counts = counts[['S', 'I', 'R', 'НД']]
             counts['Total'] = counts.sum(axis=1)
+            counts['n'] = counts[['S', 'I', 'R']].sum(axis=1)
+            if min_n > 0:
+                counts = counts[counts['n'] >= min_n]
             for col in ['S', 'I', 'R', 'НД']:
                 counts[f'{col}_%'] = counts[col] / counts['Total'] * 100
             ab_data[ab] = counts
@@ -685,35 +696,39 @@ def generate_sheet3(df, log_func=None):
 #    и листа 5 (раневые антибиотики с локализацией)
 # ----------------------------------------------------------------------
 
-def generate_antibiotic_sheet(ab_data, log_func=None):
+def generate_antibiotic_sheet(ab_data, log_func=None, min_n=0):
     """
     Создаёт DataFrame для листа с антибиотикорезистентностью.
     Для каждого антибиотика выводит таблицу с результатами.
     Если индекс DataFrame содержит несколько уровней (например, organism и material_raw),
     то будет добавлена колонка "Локализация".
+
+    min_n — порог значимости (число ОПРЕДЕЛЁННЫХ ответов S+I+R): строки,
+    где n < min_n, из таблицы исключаются (0 = без порога — поведение по
+    умолчанию). Проценты считаются как раньше, от Total = S+I+R+НД;
+    колонка «n» показывает, из скольких определений получен результат.
     """
     if not ab_data:
         if log_func:
             log_func("Нет данных по антибиотикам для листа")
         return pd.DataFrame()
 
+    min_n = parse_min_significant(min_n)
+    dropped = 0
     all_rows = []
     for antibiotic, df_ab in ab_data.items():
         if df_ab.empty:
             continue
         # Определяем, является ли индекс MultiIndex
         is_multi = isinstance(df_ab.index, pd.MultiIndex)
-        # Заголовок антибиотика
-        all_rows.append([f"Антибиотик: {antibiotic}"])
-        # Заголовки столбцов
-        if is_multi:
-            header = ['Микроорганизм', 'Локализация', 'S', 'I', 'R', 'НД', 'Total', 'S%', 'I%', 'R%', 'НД%']
-        else:
-            header = ['Микроорганизм', 'S', 'I', 'R', 'НД', 'Total', 'S%', 'I%', 'R%', 'НД%']
-        all_rows.append(header)
-
-        # Обходим строки
+        # Обходим строки (сначала собираем, чтобы знать, есть ли значимые)
+        body_rows = []
         for idx, row in df_ab.iterrows():
+            n_val = int(row['n']) if 'n' in row.index else \
+                int(row['S'] + row['I'] + row['R'])
+            if min_n > 0 and n_val < min_n:
+                dropped += 1
+                continue
             if is_multi:
                 # idx - кортеж (organism, material_raw)
                 organism, location = idx
@@ -721,7 +736,7 @@ def generate_antibiotic_sheet(ab_data, log_func=None):
                     organism,
                     location,
                     row['S'], row['I'], row['R'], row['НД'],
-                    row['Total'],
+                    row['Total'], n_val,
                     round(row['S_%'], 1), round(row['I_%'], 1),
                     round(row['R_%'], 1), round(row['НД_%'], 1)
                 ]
@@ -730,15 +745,31 @@ def generate_antibiotic_sheet(ab_data, log_func=None):
                 row_data = [
                     organism,
                     row['S'], row['I'], row['R'], row['НД'],
-                    row['Total'],
+                    row['Total'], n_val,
                     round(row['S_%'], 1), round(row['I_%'], 1),
                     round(row['R_%'], 1), round(row['НД_%'], 1)
                 ]
-            all_rows.append(row_data)
+            body_rows.append(row_data)
+        if not body_rows:
+            continue
+        # Заголовок антибиотика
+        all_rows.append([f"Антибиотик: {antibiotic}"])
+        # Заголовки столбцов («n» — число определённых ответов S+I+R)
+        if is_multi:
+            header = ['Микроорганизм', 'Локализация', 'S', 'I', 'R', 'НД',
+                      'Total', 'n', 'S%', 'I%', 'R%', 'НД%']
+        else:
+            header = ['Микроорганизм', 'S', 'I', 'R', 'НД', 'Total', 'n',
+                      'S%', 'I%', 'R%', 'НД%']
+        all_rows.append(header)
+        all_rows.extend(body_rows)
         all_rows.append([])  # пустая строка после таблицы
     # Убираем последнюю пустую строку
     if all_rows and all_rows[-1] == []:
         all_rows.pop()
+    if min_n > 0 and dropped and log_func:
+        log_func(f"Порог значимости n≥{min_n}: из антибиотикограммы "
+                 f"исключено строк с меньшим числом определений — {dropped}.")
     # Преобразуем в DataFrame
     df_result = pd.DataFrame(all_rows)
     return df_result
@@ -907,7 +938,33 @@ _WEEKDAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Ч�
 #: Порядок сортировки колонок-метрик в итоговом листе
 METRIC_COLUMN_ORDER = ['Всего проб', 'Проб с ростом', '% положительных',
                        'Диагностичных', '% диагностичных', 'Уникальных пациентов',
-                       'S', 'I', 'R', 'НД', 'Total', 'S%', 'I%', 'R%', 'НД%']
+                       'S', 'I', 'R', 'НД', 'Total', 'n', 'S%', 'I%', 'R%', 'НД%']
+
+#: Порог значимости по умолчанию (число определённых ответов S+I+R, ниже
+#: которого строка/ячейка не попадает в листы). 0 = порог не применяется.
+DEFAULT_MIN_SIGNIFICANT = 0
+
+
+def min_n_from_spec(spec, key='min_n'):
+    """Достаёт порог значимости из спецификации листа (строка/число).
+
+    Пустое значение или «0» означает «без порога». Отрицательные значения
+    трактуются как 0. Используется всеми режимами: базовые листы,
+    конструктор и сравнение клиник.
+    """
+    return parse_min_significant((spec or {}).get(key))
+
+
+def parse_min_significant(value, default=DEFAULT_MIN_SIGNIFICANT):
+    """Приводит значение порога значимости к целому >= 0.
+
+    Принимает int/str/None; некорректные значения -> default.
+    """
+    try:
+        n = int(float(str(value).strip().replace(',', '.')))
+    except (TypeError, ValueError, AttributeError):
+        return max(int(default), 0)
+    return max(n, 0)
 
 
 def _has_date(d):
@@ -1076,13 +1133,17 @@ def compute_group_stats(df, group_cols):
 
 
 def compute_ab_group_stats(data, antibiotics, ab_indices, group_cols, antibiotic,
-                           only_positive=True, base_df=None):
+                           only_positive=True, base_df=None, min_n=0):
     """Статистика S/I/R/НД по выбранному антибиотику для заданных полей группировки.
 
     group_cols — реальные колонки (после resolve_group_fields); пустой список
     означает режим «Всё вместе» (одна итоговая строка). Производные поля
     (category, year, month, quarter, week, weekday) подтягиваются из base_df.
     Счёт идёт по всем образцам с ростом: пустое значение RSI считается как «НД».
+
+    min_n — порог значимости: строки, где число ОПРЕДЕЛЁННЫХ ответов (S+I+R)
+    меньше min_n, исключаются из таблицы (0 = без порога). Колонка «n»
+    (число определённых ответов) всегда возвращается в результате.
 
     Особый случай: antibiotic == AB_ALL_KEY («Все антибиотики») — считается
     суммарная антибиотикограмма по всем АБ-колонкам сразу (каждая ячейка
@@ -1153,6 +1214,12 @@ def compute_ab_group_stats(data, antibiotics, ab_indices, group_cols, antibiotic
         counts.columns = [str(c) for c in counts.columns]
     counts = counts.drop(columns=['_rsi'], errors='ignore')
     counts['Total'] = counts[AB_METRICS].sum(axis=1)
+    # «n» — число ОПРЕДЕЛЁННЫХ ответов (S+I+R): именно из них считаются
+    # проценты режима сравнения; в базовых листах показывается для наглядности
+    counts['n'] = counts[['S', 'I', 'R']].sum(axis=1)
+    min_n = max(int(min_n or 0), 0)
+    if min_n > 0:
+        counts = counts[counts['n'] >= min_n]
     total_f = counts['Total'].astype(float).replace(0, np.nan)
     for m in AB_METRICS:
         counts[f'{m}%'] = (counts[m].astype(float) / total_f * 100).round(1).fillna(0)
@@ -1190,8 +1257,16 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
       metrics     — список метрик; если содержит 'ab', считается антибиотикограмма
       antibiotic  — название антибиотика (когда metrics включает 'ab')
       filter      — ключ фильтра (FILTER_OPTIONS)
+      min_n       — порог значимости (S+I+R), применяется и к АБГ-листам,
+                    и к матрицам (MATRIX_AB_ORG_KEY / MATRIX_AB_ONLY_KEY)
     Возвращает DataFrame или None, если лист построить не удалось.
+    Режимы «матрица» (matrix_mode) строятся отдельно — см. build_matrix_sheets.
     """
+    if spec.get('mode') in _MATRIX_MODE_KEYS:
+        dfs, _meta = build_matrix_sheets(spec, base_df, data, antibiotics,
+                                         ab_indices, log_func=log_func)
+        # у матричного режима ровно один лист
+        return next(iter(dfs.values())) if dfs else None
     valid_groups = dict(GROUP_FIELDS)
     groups = [g for g in spec.get('groups', []) if g in valid_groups]
     if not groups:
@@ -1228,11 +1303,14 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
         ab_name = spec.get('antibiotic', '')
         try:
             ab_stats = compute_ab_group_stats(data, antibiotics, ab_indices, group_cols,
-                                              ab_name, base_df=base_df)
+                                              ab_name, base_df=base_df,
+                                              min_n=parse_min_significant(
+                                                  spec.get('min_n')))
             # нормализуем структуру АБГ-таблицы для слияния: оставляем только
             # колонки группировки и метрики S/I/R/НД (служебные index/_rsi — в мусор)
             ab_keep = [c for c in group_cols if c in ab_stats.columns]
-            ab_mcols = [c for c in AB_METRICS + ['Total'] + [f'{m}%' for m in AB_METRICS]
+            ab_mcols = [c for c in AB_METRICS + ['Total', 'n'] +
+                        [f'{m}%' for m in AB_METRICS]
                         if c in ab_stats.columns]
             missing = [c for c in group_cols if c not in ab_stats.columns]
             ab_stats = ab_stats[ab_keep + ab_mcols].copy()
@@ -1267,7 +1345,7 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
                                        errors='ignore').reset_index(drop=True)],
                                axis=1)
         # строки без антибиотикограммы (группы только в посевной статистике)
-        for c in ('S', 'I', 'R', 'НД', 'Total'):
+        for c in ('S', 'I', 'R', 'НД', 'Total', 'n'):
             if c in result.columns:
                 result[c] = result[c].fillna(0).astype(int)
         for c in ('S%', 'I%', 'R%', 'НД%'):
@@ -1340,10 +1418,26 @@ def build_sheet_from_spec(spec, base_df, data, antibiotics, ab_indices, log_func
                 result = result.sort_values('Всего проб', ascending=False)
         result = result.reset_index(drop=True)
 
+    # ---- порог значимости для листов конструктора --------------------------
+    # Строки антибиотикограммы, где число ОПРЕДЕЛЁННЫХ ответов (n = S+I+R)
+    # меньше порога, из листа исключаются; строки без АБГ (чистая посевная
+    # статистика) остаются. Порог задаётся полем «Порог значимости n≥» в
+    # карточке листа; 0/пусто = без порога.
+    min_n = min_n_from_spec(spec)
+    dropped_rows = 0
+    if min_n > 0 and 'n' in result.columns and not is_total:
+        before = len(result)
+        mask = result['n'] > 0
+        mask |= pd.to_numeric(result['n'], errors='coerce').fillna(0) >= min_n
+        result = result[mask].reset_index(drop=True)
+        dropped_rows = before - len(result)
+
     if log_func:
         desc = 'всё вместе (итог)' if is_total else \
                ', '.join(col_labels[c] for c in group_cols)
-        log_func(f"Лист «{spec.get('name')}»: {len(result)} строк (группировка: {desc}).")
+        log_func(f"Лист «{spec.get('name')}»: {len(result)} строк (группировка: {desc})."
+                 + (f" Порог значимости n≥{min_n}: исключено строк — {dropped_rows}."
+                    if min_n and dropped_rows else ""))
     return result
 
 
@@ -1366,6 +1460,24 @@ def validate_spec(spec, available_antibiotics=None):
     name = sanitize_sheet_name(str(spec.get('name', '')).strip())
     if len(name) > 31:
         errors.append("Название листа не должно превышать 31 символ.")
+    # порог значимости — общий для всех режимов (пусто/0 = без порога);
+    # parse_min_significant приводит некорректные значения к 0, поэтому
+    # отдельная проверка нужна только для явного выхода за разумный диапазон
+    mn_raw = spec.get('min_n')
+    if str(mn_raw).strip() not in ('', 'None'):
+        mn = parse_min_significant(mn_raw)
+        if mn > 1000:
+            errors.append("Порог значимости должен быть от 0 (без порога) до 1000.")
+    # матричные режимы конструктора: антибиотики в колонках
+    if spec.get('mode') in _MATRIX_MODE_KEYS:
+        raw_abs = spec.get('antibiotics') or []
+        abs_list = [a for a in raw_abs if a and a != AB_ALL_KEY]
+        if available_antibiotics is not None:
+            missing = [a for a in abs_list if a not in available_antibiotics]
+            if missing:
+                errors.append("Антибиотики отсутствуют в текущем исходном файле: "
+                              + ", ".join(missing[:5]))
+        return errors
     is_compare = spec.get('mode') == COMPARE_CLINICS_KEY
     if is_compare:
         # отдельный режим «Сравнение клиник»: список антибиотиков + клиники.
@@ -1455,24 +1567,35 @@ def filter_data_by_clinic(data, antibiotics, ab_indices, clinic):
 #: Пункт выбора клиники на главном окне: отдельный режим «Сравнение клиник»
 COMPARE_CLINICS_LABEL = '⚖️ Сравнение клиник'
 
-#: Минимальное число ОПРЕДЕЛЁННЫХ ответов (S+I+R), ниже которого доля S%
-#: считается статистически незначимой и в листы сравнения (матрицу,
-#: топы различий, графики) не попадает. Порог относится ТОЛЬКО к режиму
-#: «Сравнение клиник» — базовые листы 1–3 считаются по исходным правилам
-#: без всяких порогов.
+#: Минимальное число ОПРЕДЕЛЁННЫХ ответов (S+I+R) по умолчанию, ниже
+#: которого доля не считается значимой и в листы сравнения (матрицу,
+#: топы различий, графики) не попадает. Значение можно переопределить:
+#: поле «Порог значимости» на главном окне (все режимы), ключ spec['min_n']
+#: каждого листа конструктора и отдельного режима сравнения; 0 = без порога.
 CMP_MIN_SIGNIFICANT = 5
 
 
 def _s_pct_of_defined(s, i, r):
     """Доля чувствительных среди ОПРЕДЕЛЁННЫХ ответов (S+I+R).
 
-    Используется только в режиме «Сравнение клиник»: строки, где
-    антибиотик не испытывался (пусто / только MIC / «нет роста»),
-    в знаменатель не входят — иначе S% искусственно занижается до
-    1–3% и сравнение клиник теряет смысл.
+    Базовая функция сравнения: S% = S / (S + I + R) × 100. Строки, где
+    антибиотик не испытывался (пусто / только MIC / «нет роста»), в
+    знаменатель не входят — иначе показатель занижается до единиц
+    процентов и сравнение теряет смысл.
     """
     det = s + i + r
     return round(s / det * 100, 1) if det else None
+
+
+def _si_pct_of_defined(s, i, r):
+    """Доля «не устойчивых» (S+I) среди ОПРЕДЕЛЁННЫХ ответов (S+I+R).
+
+    Формула режима «Сравнение клиник»: (S + I) / (S + I + R) × 100 —
+    показывает, какой доле изолятов антибиотик «подходит» (чувствительные
+    + промежуточные). Используется в матрицах сравнения и на графиках.
+    """
+    det = s + i + r
+    return round((s + i) / det * 100, 1) if det else None
 
 
 def _cmp_pct_cols(ws, hdr_row):
@@ -1494,11 +1617,172 @@ def _cmp_pct_cols(ws, hdr_row):
 
 
 def get_compare_sheet_names(spec_name):
-    """Имена листов режима сравнения: таблица + матрица + графики."""
-    base = sanitize_sheet_name(str(spec_name).strip())[:25] or 'Сравнение'
+    """Имена листов режима сравнения: таблица + матрица (с материалом) +
+    матрица без разделения по материалам + графики.
+
+    Возвращает 4 имени в порядке листов: (таблица, матрица, матрица_орг,
+    графики). «Матрица-микробы» — вторая матрица сравнения без разделения
+    по материалам (строки — только микроорганизмы)."""
+    base = sanitize_sheet_name(str(spec_name).strip())[:22] or 'Сравнение'
     return (base,
             sanitize_sheet_name(f'{base} (матрица)')[:31],
+            sanitize_sheet_name(f'{base} (матрица-микробы)')[:31],
             sanitize_sheet_name(f'{base} (графики)')[:31])
+
+
+# Ключи спецификации листа для режимов «матрица» конструктора:
+# колонки — антибиотики; строки — группы; значение — (S+I)/(S+I+R)×100.
+MATRIX_AB_ORG_KEY = 'matrix_ab_org'      # строки: микроорганизм × материал
+MATRIX_AB_ONLY_KEY = 'matrix_ab_only'    # строки: только микроорганизм
+MATRIX_AB_ORG_LABEL = 'Матрица: антибиотики × микроорганизм/материал, (S+I)/(S+I+R)'
+MATRIX_AB_ONLY_LABEL = 'Матрица: антибиотики × микроорганизм, (S+I)/(S+I+R)'
+_MATRIX_MODE_KEYS = (MATRIX_AB_ORG_KEY, MATRIX_AB_ONLY_KEY)
+
+
+def _matrix_ab_cells(pos, data, selected_abs, ab_indices, row_fields):
+    """Считает ячейки матрицы «антибиотик × строки» для режима сравнения.
+
+    Возвращает dict cells[(ключ строки, антибиотик)] = (pct, n_def, answered),
+    где pct — доля «не устойчивых» по формуле (S + I) / (S + I + R) × 100
+    (None, если определённых ответов нет), n_def — число определений S+I+R,
+    answered — всего полученных ответов (S+I+R+НД). Ключ строки — кортеж
+    значений row_fields; пустой row_fields даёт один ключ ('Все данные',).
+    Используется и в режиме «Сравнение клиник» (по подвыборке одной
+    клиники), и в листе-матрице обычного конструктора.
+    """
+    def _rsi(v):
+        if isinstance(v, str):
+            s = v.strip().upper()
+            return s if s in AB_METRICS else 'НД'
+        return 'НД'
+
+    # нормализуем поля строк — groupby по отсутствующей колонке падал с
+    # неочевидной KeyError на файлах без столбца «Материал»
+    row_fields = [f for f in (row_fields or []) if f in pos.columns]
+
+    cells = {}
+    for j, ab in enumerate(selected_abs):
+        col_i = ab_indices[j] if j < len(ab_indices) else None
+        if col_i is None or not (0 <= col_i < data.shape[1]):
+            continue
+        tmp = pd.DataFrame({'_rsi': data.iloc[:, col_i].reindex(pos.index).apply(_rsi)})
+        if row_fields:
+            for f in row_fields:
+                tmp[f] = pos[f].reindex(tmp.index).values
+            counts = tmp.groupby(row_fields + ['_rsi'], observed=True).size()\
+                        .unstack('_rsi', fill_value=0)
+            if isinstance(counts.index, pd.MultiIndex):
+                counts = counts.reset_index()
+            else:
+                # одиночная группировка: метки остались в индексе unstack
+                counts.insert(0, row_fields[0], list(counts.index))
+                counts = counts.reset_index(drop=True)
+        else:
+            vc = tmp['_rsi'].value_counts()
+            counts = pd.DataFrame({m: [int(vc.get(m, 0))] for m in AB_METRICS})
+        for m in AB_METRICS:
+            if m not in counts.columns:
+                counts[m] = 0
+        for _, r in counts.iterrows():
+            key = tuple(str(r[f]) for f in row_fields) if row_fields else ('Все данные',)
+            s_, i_, rr_, nd_ = (int(r['S']), int(r['I']), int(r['R']), int(r['НД']))
+            n_def = s_ + i_ + rr_
+            answered = n_def + nd_
+            pct = _si_pct_of_defined(s_, i_, rr_)
+            cells[(key, ab)] = (pct, n_def, answered)
+    return cells
+
+
+def build_matrix_sheets(spec, base_df, data, antibiotics, ab_indices, log_func=None):
+    """Листы-матрицы обычного режима: колонки — антибиотики, строки —
+    микроорганизмы (или микроорганизм × материал), значения — доля
+    «не устойчивых» по формуле (S + I) / (S + I + R) × 100.
+
+    Ключи спецификации:
+      matrix_mode — MATRIX_AB_ORG_KEY (строки с материалом) или
+                    MATRIX_AB_ONLY_KEY (только микроорганизм);
+      antibiotics — список антибиотиков (пусто — все из файла);
+      filter      — обычный фильтр конструктора;
+      min_n       — порог значимости (ячейки с n < min_n не показывается).
+
+    Возвращает (dict {имя листа: DataFrame}, meta). Пустые ячейки — «нет теста»
+    (антибиотик паре не назначался либо определений меньше порога) либо
+    «нет посевов» (у микроорганизма нет проб этого материала). Ячейки
+    содержат текст «NN.N% (n=k)», чтобы было видно, из скольких определений
+    получен процент. Оформление листа (тепловая шкала + легенда) общее с
+    матрицами сравнения клиник.
+    """
+    only_org = spec.get('matrix_mode') == MATRIX_AB_ONLY_KEY
+    row_fields = ['organism'] if only_org else ['organism', 'material_raw']
+
+    wanted_abs = [a for a in (spec.get('antibiotics') or
+                              ([spec['antibiotic']] if spec.get('antibiotic') else []))
+                  if a and a != AB_ALL_KEY]
+    selected_abs = [a for a in antibiotics if a in set(wanted_abs)] if wanted_abs \
+        else list(antibiotics)
+    if not selected_abs:
+        raise ValueError("В исходном файле не найдено колонок антибиотиков — "
+                         "матрица не может быть построена.")
+
+    filtered = apply_spec_filter(base_df, spec)
+    pos = filtered[filtered['is_positive']].copy() if 'is_positive' in filtered.columns \
+        else filtered.copy()
+    if pos.empty:
+        raise ValueError("После фильтра не осталось проб с ростом — матрица пустая.")
+
+    for f in row_fields:
+        if f not in pos.columns:
+            pos[f] = ''
+        pos[f] = pos[f].fillna('').astype(str).str.strip()
+    combos = sorted(set(map(tuple, pos[row_fields].drop_duplicates().values.tolist())))
+
+    min_n = parse_min_significant(spec.get('min_n'))
+    # порог значимости применяется к ячейкам матрицы; если задан 0/пусто —
+    # показываем любое число определений (надёжность видна по «n» в ячейке).
+    eff_min_n = max(min_n, 1)
+    cells = _matrix_ab_cells(pos, data, selected_abs, ab_indices, row_fields)
+
+    # строки, где ни один антибиотик не дал даже одного ответа — исключаем
+    rows_keys = [k for k in combos
+                 if any(cells.get((k, ab), (None, 0, 0))[2] > 0 for ab in selected_abs)]
+    if not rows_keys:
+        raise ValueError("По выбранным антибиотикам нет ни одного определения — "
+                         "измените настройки листа.")
+
+    row_label = 'Микроорганизм' if only_org else 'Микроорганизм / материал'
+    header = [row_label] + selected_abs
+    all_rows = []
+    used_statuses = set()
+    for key in rows_keys:
+        lbl = key[0] if len(key) == 1 else ' | '.join(key)
+        vals = []
+        for ab in selected_abs:
+            pct, n_def, answered = cells.get((key, ab), (None, 0, 0))
+            if pct is None or n_def < eff_min_n:
+                status = 'no_cultures' if answered <= 0 else 'no_test'
+                vals.append('нет посевов' if status == 'no_cultures' else 'нет теста')
+                used_statuses.add(status)
+            else:
+                vals.append(f"{pct}% (n={n_def})")
+                used_statuses.add('ok')
+        all_rows.append([lbl] + vals)
+
+    df_mat = pd.DataFrame([header] + all_rows)
+    name = sanitize_sheet_name(str(spec.get('name', 'Матрица')).strip())[:20] or 'Матрица'
+    suffix = '(микробы)' if only_org else '(микр×матер.)'
+    sheet_name = sanitize_sheet_name(f"{name} {suffix}")[:31]
+    meta = {'matrix_legend': True, 'matrix_row_label': row_label,
+            'matrix_min_n': min_n, 'matrix_statuses': used_statuses,
+            # подписи для стиля листа: левый столбец и шапка блока — как в
+            # матрицах сравнения клиник (см. _style_compare_matrix)
+            'matrix_labels': [row_label],
+            'matrix_block_title': f"Матрица: антибиотики × "
+                                  f"{'микроорганизмы' if only_org else 'микроорганизм / материал'}"}
+    if log_func:
+        log_func(f"Лист «{sheet_name}»: {len(all_rows)} строк × "
+                 f"{len(selected_abs)} антибиотиков; формула (S+I)/(S+I+R)."
+                 + (f" Порог значимости n≥{min_n}." if min_n else ""))
+    return {sheet_name: df_mat}, meta
 
 
 def _cmp_heat_style(v):
@@ -1542,21 +1826,23 @@ def count_rows_by_clinic(data):
     return counts
 
 
-def _cmp_block_stats(sub, data, col_i, row_fields, combos):
+def _cmp_block_stats(sub, data, col_i, row_fields, combos, min_n=CMP_MIN_SIGNIFICANT):
     """Считает строки блока (клиника × антибиотик) в формате листа 3.
 
     Возвращает (rows_out, total_row, chart_items, labels_out):
       rows_out    — строки [ключ группы..., S, I, R, НД, Total, n,
                             S%, I%, R%];
       total_row   — итоговая строка «ВСЕГО» в том же формате;
-      chart_items — [(подпись, S%, n)] для значимых строк
-                    (n ≥ CMP_MIN_SIGNIFICANT);
+      chart_items — [(подпись, значение, n)] для значимых строк
+                    (n ≥ min_n); значение считается по формуле сравнения
+                    (S+I)/(S+I+R)×100 — см. _si_pct_of_defined;
       labels_out  — все подписи строк блока (для матрицы).
     Проценты считаются по ОПРЕДЕЛЁННЫМ ответам (S+I+R), без «НД» в
     знаменателе — строки, где антибиотик не испытывался, занижали бы
     чувствительность до единиц процентов. Столбец «n» показывает, из
     скольких определений получен процент (колонка «НД%» заменена на «n»,
-    т.к. НД = Total − n).
+    т.к. НД = Total − n). Колонки S%/I%/R% табличного листа — доли каждого
+    ответа среди определённых (S:(S+I+R) и т.д.), колонка «Всего» отсутствует.
     Строки сортируются по общему списку комбинаций (combos), поэтому блоки
     разных клиник содержат одинаковые наборы «микроорганизм × материал»
     в одном порядке — сравнение визуально сопоставимо.
@@ -1605,8 +1891,9 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
         tot = s + i_ + rr + nd          # всего проб с ростом в ячейке
         n_def = s + i_ + rr             # определений S+I+R — база для процентов
         pcts = [_s_pct_of_defined(s, i_, rr), _s_pct_of_defined(i_, rr, s),
-                _s_pct_of_defined(rr, s, i_)]
-        stats[key] = [s, i_, rr, nd, tot, n_def] + pcts
+                _s_pct_of_defined(rr, s, i_)]      # доли S/I/R среди определённых
+        si_pct = _si_pct_of_defined(s, i_, rr)     # формула сравнения (S+I)/(S+I+R)
+        stats[key] = [s, i_, rr, nd, tot, n_def] + pcts + [si_pct]
 
     rows_out, chart_items, labels_out = [], [], []
     for key in combos:
@@ -1618,8 +1905,8 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
         labels_out.append(lbl)
         # в графики и значимые сравнения — только строки с достаточным числом
         # определений (иначе процент получен на 1–4 изолятах и несопоставим)
-        if vals[5] >= CMP_MIN_SIGNIFICANT and vals[6] is not None:
-            chart_items.append((lbl, vals[6], vals[5]))
+        if vals[5] >= min_n and vals[9] is not None:
+            chart_items.append((lbl, vals[9], vals[5]))
     if not rows_out:
         return rows_out, None, chart_items, labels_out
 
@@ -1631,7 +1918,8 @@ def _cmp_block_stats(sub, data, col_i, row_fields, combos):
                   int(stot), int(sn),
                   _s_pct_of_defined(sums[0], sums[1], sums[2]) or 0.0,
                   _s_pct_of_defined(sums[1], sums[2], sums[0]) or 0.0,
-                  _s_pct_of_defined(sums[2], sums[0], sums[1]) or 0.0])
+                  _s_pct_of_defined(sums[2], sums[0], sums[1]) or 0.0,
+                  _si_pct_of_defined(sums[0], sums[1], sums[2]) or 0.0])
     return rows_out, total_row, chart_items, labels_out
 
 
@@ -1645,13 +1933,16 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     сравнивает одни и те же антибиотики, микроорганизмы и материал
     в условиях разных клиник: под общим заголовком идёт подзаголовок
     клиники, затем строки по этой клинике и итоговая строка «ВСЕГО».
-    Вместе с таблицей создаётся лист с графиками S% по клиникам.
+    Вместе с таблицей создаются два листа-матрицы сравнения («… (матрица)»
+    со строками «микроорганизм / материал» и «… (матрица-микробы)» — без
+    разделения по материалам) и лист с графиками S% по клиникам.
 
     Ключи спецификации:
       antibiotics — список антибиотиков (пусто/AB_ALL_KEY — все найденные);
       compare_by  — поля строк: 'organism' и/или 'material_raw';
       clinics     — список клиник для сравнения (пусто — все из файла);
-      filter      — обычный фильтр конструктора (применяется ко всем блокам).
+      filter      — обычный фильтр конструктора (применяется ко всем блокам);
+      min_n       — порог значимости (по умолчанию CMP_MIN_SIGNIFICANT).
     """
     # --- разбор спецификации ---
     compare_by = [g for g in spec.get('compare_by', ['organism'])
@@ -1679,6 +1970,10 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     if len(clinics) < 2:
         raise ValueError("Для сравнения отметьте минимум две клиники.")
 
+    # порог значимости режима сравнения (число определённых ответов S+I+R);
+    # задаётся полем «Порог значимости» на главном окне / в карточке листа
+    min_n = parse_min_significant(spec.get('min_n'), default=CMP_MIN_SIGNIFICANT)
+
     # --- строки таблицы: посевы (фильтр) + антибиотикограмма по АБ-колонкам ---
     filtered = apply_spec_filter(base_df, spec)
     pos = filtered[filtered['is_positive']].copy() if 'is_positive' in filtered.columns else filtered.copy()
@@ -1700,7 +1995,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         combos = [('Все данные',)]
 
     blocks = []          # (ab, clinic, rows(list), total_row(list))
-    chart_data = []      # (ab, clinic, [(label, S%)])
+    chart_data = []      # (ab, clinic, [(label, значение, n)])
     block_totals = {}    # (ab, clinic, label) -> число ПОЛУЧЕННЫХ ответов (S+I+R+НД)
     block_defines = {}   # (ab, clinic, label) -> число определённых ответов (S+I+R)
     for ab in selected_abs:
@@ -1711,15 +2006,15 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             if sub.empty:
                 continue
             rows_out, total_row, chart_items, labels_out = _cmp_block_stats(
-                sub, data, col_i, row_fields, combos)
+                sub, data, col_i, row_fields, combos, min_n=min_n)
             if not rows_out:
                 continue
             blocks.append((ab, cl, rows_out, total_row))
-            # значимые строки (n ≥ CMP_MIN_SIGNIFICANT) — для матрицы и графиков
+            # значимые строки (n ≥ min_n) — для матриц и графиков
             chart_data.append((ab, cl, list(chart_items)))
             for lbl, row_vals in zip(labels_out, rows_out):
                 # Числовые столбцы строки блока после ключей:
-                # [S, I, R, НД, Total, n, S%, I%, R%]
+                # [S, I, R, НД, Total, n, S%, I%, R%, Всего%]
                 nums = row_vals[len(row_fields):]
                 try:
                     answered = sum(int(x) for x in nums[:4])   # S+I+R+НД
@@ -1737,7 +2032,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     header = (['Микроорганизм', 'Локализация'] if len(row_fields) == 2 else
               ['Микроорганизм'] if row_fields == ['organism'] else
               ['Локализация'] if row_fields == ['material_raw'] else ['Группа'])
-    header += AB_METRICS + ['Total', 'n', 'S%', 'I%', 'R%']
+    header += AB_METRICS + ['Total', 'n', 'S%', 'I%', 'R%', 'Всего%']
     ncol = len(header)
     all_rows = []
     cur_ab = None
@@ -1756,24 +2051,32 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         all_rows.pop()
     table_df = pd.DataFrame(all_rows)
 
-    tab_name, matrix_name, chart_name = get_compare_sheet_names(
+    tab_name, matrix_name, org_matrix_name, chart_name = get_compare_sheet_names(
         spec.get('name', 'Сравнение клиник'))
     result = {tab_name: table_df}
     # метаданные режима сравнения (используются стилями листов в save_to_excel)
-    compare_meta = {'matrix_statuses': set()}
+    compare_meta = {'matrix_statuses': set(),
+                    # подписи для стиля матриц: левый столбец шапки и заголовок
+                    # блока (в режиме конструктора свои — см. build_matrix_sheets)
+                    'matrix_labels': ['Микроорганизм / материал', 'Микроорганизм'],
+                    'matrix_block_title': ('Матрица сравнения клиник: антибиотики × '
+                                           'микроорганизм / материал'),
+                    'org_matrix_block_title': ('Матрица сравнения клиник: антибиотики × '
+                                               'микроорганизм (без разделения по материалам)')}
 
-    # --- лист «матрица»: один экран на весь набор сравнения ---
-    # Строки: Антибиотик × микроорганизм/материал; колонки: клиники (S%).
-    # S% считается по ОПРЕДЕЛЁННЫМ ответам (S+I+R); в матрицу попадают только
-    # значимые ячейки — с n ≥ CMP_MIN_SIGNIFICANT. Ячейки окрашиваются по
-    # цветовой шкале чувствительности (см. _style_compare_matrix).
+    # --- листы «матрица»: один экран на весь набор сравнения ---
+    # Строки: Антибиотик × микроорганизм/материал; колонки: клиники.
+    # Значение — доля «не устойчивых» по формуле сравнения (S+I)/(S+I+R);
+    # в матрицу попадают только значимые ячейки — с n ≥ порога min_n.
+    # Ячейки окрашиваются по цветовой шкале (см. _style_compare_matrix).
+    # Второй лист «матрица-микробы» — то же сравнение, но без разделения
+    # по материалам: строки — только микроорганизмы.
     # Статусы ячеек:
     #   «42.9% (n=14)» — значение и число определений, из которых оно получено;
     #   «нет теста»    — посевы были, но антибиотик этой паре не назначался
-    #                    либо определений меньше порога значимости (значения
-    #                    на 1–4 изолятах в сравнении не показываем);
+    #                    либо определений меньше порога значимости;
     #   «нет посевов»  — у клиники нет проб с этим микроорганизмом/материалом.
-    s_map = {}          # (ab, label) -> {clinic: (S%, n)} — только значимые
+    s_map = {}          # (ab, label) -> {clinic: ((S+I)%, n)} — только значимые
     n_map = {}          # (ab, label) -> {clinic: получено ответов (S+I+R+НД)}
     d_map = {}          # (ab, label) -> {clinic: определённых ответов (S+I+R)}
     for ab, cl, items in chart_data:
@@ -1795,57 +2098,141 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             return 'нет теста', 'no_test'
         return f"{got[0]}% (n={got[1]})", 'ok'
 
-    matrix_rows = []
-    diff_rows = []      # (abs(d), row_values) — для сводки различий
     used_statuses = set()
-    for ab in selected_abs:
-        # в матрицу попадают только наборы «микроорганизм / материал», по которым
-        # ХОТЬ ОДНА клиника получила ЗНАЧИМОЕ значение S% (n ≥ порога).
-        # Строки, где не было бы ни одного значения (везде «нет посевов» /
-        # «нет теста»), из таблицы исключаются.
-        labels_ab = sorted(lbl for (a, lbl) in s_map if a == ab)
-        if not labels_ab:
-            continue
-        matrix_rows.append([f"Антибиотик: {ab}"] + [''] * (len(clinics) + 2))
-        matrix_rows.append(['Микроорганизм / материал'] + clinics +
-                           ['Max−min', 'Разница (лучшая → худшая)'])
-        for lbl in labels_ab:
-            d = s_map[(ab, lbl)]
-            tested = [(cl, pv[0], pv[1]) for cl in clinics
-                      if (pv := d.get(cl)) is not None]
-            nums = [v for _, v, _ in tested]
-            spread = round(max(nums) - min(nums), 1) if len(nums) >= 2 else ''
-            best_worst = ''
-            if len(nums) >= 2 and spread != '':
-                mx, mn = max(nums), min(nums)
-                bcl, _, nb = next(t for t in tested if t[1] == mx)
-                wcl, _, nw = next(t for t in tested if t[1] == mn)
-                if mx > mn:
-                    best_worst = (f"{bcl} (+{round(mx - mn, 1)} п.п., "
-                                  f"n={nb}) vs {wcl} (n={nw})")
-                    diff_rows.append((float(spread),
-                                      [ab, lbl, f"{mx:.1f}% (n={nb})", bcl,
-                                       f"{mn:.1f}% (n={nw})", wcl,
-                                       round(mx - mn, 1)]))
-                else:
-                    best_worst = "равно"
-            elif len(tested) == 1:
-                best_worst = "значимые данные только у одной клиники"
-            row_vals = []
-            for cl in clinics:
-                txt, status = _cell_status(ab, lbl, cl)
-                row_vals.append(txt)
-                used_statuses.add(status)
-            matrix_rows.append([lbl] + row_vals + [spread, best_worst])
-        matrix_rows.append([''] * (len(clinics) + 3))
-    while matrix_rows and all(c in ('', None) for c in matrix_rows[-1]):
-        matrix_rows.pop()
-    matrix_df = pd.DataFrame(matrix_rows)
-    if len(matrix_rows) > 1:
+    diff_rows = []      # (abs(d), row_values) — для сводки различий
+
+    def _make_matrix(row_labels_fn, row_title, block_header=None):
+        """Строит DataFrame матрицы по набору s_map/n_map/d_map.
+
+        row_labels_fn(ab) — отсортированные подписи строк блока антибиотика;
+        row_title — подпись левого столбца шапки блока;
+        block_header — необязательная строка-заголовок над первым блоком
+        (тёмная шапка листа, оформляется стилем)."""
+        rows = []
+        if block_header:
+            rows.append([block_header] + [''] * (len(clinics) + 2))
+        for ab in selected_abs:
+            labels_ab = row_labels_fn(ab)
+            if not labels_ab:
+                continue
+            rows.append([f"Антибиотик: {ab}"] + [''] * (len(clinics) + 2))
+            rows.append([row_title] + clinics +
+                        ['Max−min', 'Разница (лучшая → худшая)'])
+            for lbl in labels_ab:
+                d = s_map[(ab, lbl)]
+                tested = [(cl, pv[0], pv[1]) for cl in clinics
+                          if (pv := d.get(cl)) is not None]
+                nums = [v for _, v, _ in tested]
+                spread = round(max(nums) - min(nums), 1) if len(nums) >= 2 else ''
+                best_worst = ''
+                if len(nums) >= 2 and spread != '':
+                    mx, mn = max(nums), min(nums)
+                    bcl, _, nb = next(t for t in tested if t[1] == mx)
+                    wcl, _, nw = next(t for t in tested if t[1] == mn)
+                    if mx > mn:
+                        best_worst = (f"{bcl} (+{round(mx - mn, 1)} п.п., "
+                                      f"n={nb}) vs {wcl} (n={nw})")
+                        diff_rows.append((float(spread),
+                                          [ab, lbl, f"{mx:.1f}% (n={nb})", bcl,
+                                           f"{mn:.1f}% (n={nw})", wcl,
+                                           round(mx - mn, 1)]))
+                    else:
+                        best_worst = "равно"
+                elif len(tested) == 1:
+                    best_worst = "значимые данные только у одной клиники"
+                row_vals = []
+                for cl in clinics:
+                    txt, status = _cell_status(ab, lbl, cl)
+                    row_vals.append(txt)
+                    used_statuses.add(status)
+                rows.append([lbl] + row_vals + [spread, best_worst])
+            rows.append([''] * (len(clinics) + 3))
+        while rows and all(c in ('', None) for c in rows[-1]):
+            rows.pop()
+        return pd.DataFrame(rows) if rows else None
+
+    matrix_df = _make_matrix(lambda ab: sorted(lbl for (a, lbl) in s_map if a == ab),
+                             'Микроорганизм / материал',
+                             block_header=compare_meta['matrix_block_title'])
+    if matrix_df is not None and len(matrix_df) > 1:
         result[matrix_name] = matrix_df
+
+    # --- вторая матрица: без разделения по материалам (только микробы) ---
+    # Считаем заново по подвыборкам клиник, группируя строки ТОЛЬКО по
+    # микроорганизму; в сводку различий (diff_rows) строки этой матрицы
+    # не попадают — топ-различия остаются по основной матрице.
+    if row_fields and 'organism' in row_fields:
+        org_s_map, org_n_map, org_d_map = {}, {}, {}
+        for ab in selected_abs:
+            idx = antibiotics.index(ab)
+            col_i = ab_indices[idx]
+            for cl in clinics:
+                sub = pos[pos['clinic'].astype(str).str.strip() == cl] \
+                    if 'clinic' in pos.columns else pos
+                if sub.empty:
+                    continue
+                cells_cl = _matrix_ab_cells(sub, data, [ab], [col_i], ['organism'])
+                for (key, _ab), (pct, n_def, answered) in cells_cl.items():
+                    lbl = key[0]
+                    if answered > 0:
+                        org_n_map.setdefault((ab, lbl), {})[cl] = answered
+                    if n_def > 0:
+                        org_d_map.setdefault((ab, lbl), {})[cl] = n_def
+                    if pct is not None and n_def >= min_n:
+                        org_s_map.setdefault((ab, lbl), {})[cl] = (pct, n_def)
+
+        def _org_cell_status(ab, lbl, cl):
+            nn = org_n_map.get((ab, lbl), {}).get(cl, 0)
+            nd = org_d_map.get((ab, lbl), {}).get(cl, 0)
+            got = org_s_map.get((ab, lbl), {}).get(cl)
+            if nn <= 0 and nd <= 0:
+                return 'нет посевов', 'no_cultures'
+            if got is None:
+                return 'нет теста', 'no_test'
+            return f"{got[0]}% (n={got[1]})", 'ok'
+
+        org_rows = []
+        if compare_meta.get('org_matrix_block_title'):
+            org_rows.append([compare_meta['org_matrix_block_title']] + [''] * (len(clinics) + 2))
+        for ab in selected_abs:
+            labels_ab = sorted(lbl for (a, lbl) in org_s_map if a == ab)
+            if not labels_ab:
+                continue
+            org_rows.append([f"Антибиотик: {ab}"] + [''] * (len(clinics) + 2))
+            org_rows.append(['Микроорганизм'] + clinics +
+                            ['Max−min', 'Разница (лучшая → худшая)'])
+            for lbl in labels_ab:
+                d = org_s_map[(ab, lbl)]
+                tested = [(cl, pv[0], pv[1]) for cl in clinics
+                          if (pv := d.get(cl)) is not None]
+                nums = [v for _, v, _ in tested]
+                spread = round(max(nums) - min(nums), 1) if len(nums) >= 2 else ''
+                best_worst = ''
+                if len(nums) >= 2 and spread != '':
+                    mx, mn = max(nums), min(nums)
+                    bcl, _, nb = next(t for t in tested if t[1] == mx)
+                    wcl, _, nw = next(t for t in tested if t[1] == mn)
+                    best_worst = ("равно" if mx == mn else
+                                  f"{bcl} (+{round(mx - mn, 1)} п.п., n={nb}) "
+                                  f"vs {wcl} (n={nw})")
+                elif len(tested) == 1:
+                    best_worst = "значимые данные только у одной клиники"
+                row_vals = []
+                for cl in clinics:
+                    txt, status = _org_cell_status(ab, lbl, cl)
+                    row_vals.append(txt)
+                    used_statuses.add(status)
+                org_rows.append([lbl] + row_vals + [spread, best_worst])
+            org_rows.append([''] * (len(clinics) + 3))
+        while org_rows and all(c in ('', None) for c in org_rows[-1]):
+            org_rows.pop()
+        if org_rows:
+            result[org_matrix_name] = pd.DataFrame(org_rows)
+
     # статусы передаются стилю листа (он добавит под таблицей легенду только
     # про использованные обозначения)
     compare_meta['matrix_statuses'] = used_statuses
+    compare_meta['min_n'] = min_n
 
     # --- сводка различий в конце табличного листа: топ расхождений ---
     if diff_rows:
@@ -1925,7 +2312,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
 
 
 def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_sheets=None,
-                 clinic=None, preloaded=None, base_sheets=True):
+                 clinic=None, preloaded=None, base_sheets=True, global_min_n=None):
     """Полный цикл обработки одной выборки: загрузка -> базовые листы ->
     конструктор -> Excel.
 
@@ -1937,6 +2324,9 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
     ab_indices), чтобы не читать файл повторно в многотомной обработке.
     extra_sheets — список спецификаций конструктора (дополнительные листы
     после трёх базовых). Каждое описание проверяется validate_spec().
+    global_min_n — порог значимости со главного окна: применяется к листу 3
+    и ко всем листам конструктора, у которых собственный порог не задан
+    (None/0 — без порога, поведение по умолчанию как раньше).
     """
     if preloaded is not None:
         df_main, ab_data, data, antibiotics, ab_indices = preloaded
@@ -1972,7 +2362,10 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
 
         if log_func:
             log_func("Формирование листа 3 (общая антибиотикорезистентность)...")
-        sheet4 = generate_antibiotic_sheet(ab_data, log_func=log_func)
+        # порог значимости задаётся полем на главном окне (global_min_n);
+        # по умолчанию 0 — лист строится как раньше, без исключений строк
+        sheet4 = generate_antibiotic_sheet(ab_data, log_func=log_func,
+                                           min_n=(global_min_n or 0))
     else:
         # отдельный режим (например, сравнение клиник): базовые листы не создаются
         sheet2 = pd.DataFrame()
@@ -1991,6 +2384,10 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                 if log_func:
                     log_func(f"Лист №{n}: {errs[0]} — лист пропущен.")
                 continue
+            # порог значимости со главного окна действует на листы, у которых
+            # собственный порог не задан (в т.ч. на листы режима сравнения)
+            if global_min_n and not spec.get('min_n'):
+                spec = dict(spec, min_n=int(global_min_n))
             try:
                 if spec.get('mode') == COMPARE_CLINICS_KEY:
                     dfs, meta = build_clinic_comparison(
@@ -1999,6 +2396,19 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                         log_func=log_func)
                     compare_meta_all['matrix_statuses'] |= \
                         meta.get('matrix_statuses', set())
+                    # метаданные каждого листа сравнения (заголовки блоков,
+                    # пороги) — для стиля конкретного листа по имени
+                    for nm_m in dfs:
+                        compare_meta_all.setdefault('matrix_sheet_meta', {})[nm_m] = meta
+                elif spec.get('mode') in _MATRIX_MODE_KEYS:
+                    # лист-матрица конструктора: имя листа даёт сам билдер
+                    dfs, meta = build_matrix_sheets(
+                        spec, base, data, antibiotics, ab_indices,
+                        log_func=log_func)
+                    compare_meta_all['matrix_statuses'] |= \
+                        meta.get('matrix_statuses', set())
+                    for nm_m in dfs:
+                        compare_meta_all.setdefault('matrix_sheet_meta', {})[nm_m] = meta
                 else:
                     df_sheet = build_sheet_from_spec(spec, base, data, antibiotics, ab_indices,
                                                      log_func=log_func)
@@ -2040,11 +2450,13 @@ def make_per_clinic_output_path(output_path, clinic):
 
 
 def run_pipeline_multi_clinic(input_path, output_path, styled=True, log_func=None,
-                              extra_sheets=None, clinics=None):
+                              extra_sheets=None, clinics=None, global_min_n=None):
     """Обработка «Все клиники»: каждый набор данных сохраняется в отдельный файл.
 
     Возвращает dict {код клиники: путь к созданному файлу}. Если клиник в
     файле не обнаружено — создаётся один общий файл (как в run_pipeline).
+    global_min_n — порог значимости со главного окна (передается в каждый
+    run_pipeline).
     """
     if clinics is None:
         clinics = detect_clinics(input_path, log_func=None)
@@ -2053,7 +2465,7 @@ def run_pipeline_multi_clinic(input_path, output_path, styled=True, log_func=Non
         if log_func:
             log_func("Клиники в файле не обнаружены — обработка одной общей выборкой.")
         run_pipeline(input_path, output_path, styled=styled, log_func=log_func,
-                     extra_sheets=extra_sheets)
+                     extra_sheets=extra_sheets, global_min_n=global_min_n)
         results[DEFAULT_CLINIC_LABEL] = output_path
         return results
     # читаем исходный файл один раз для всех клиник
@@ -2066,14 +2478,16 @@ def run_pipeline_multi_clinic(input_path, output_path, styled=True, log_func=Non
         if log_func:
             log_func(f"— Клиника {cl}: сохранение в {os.path.basename(path)}")
         run_pipeline(input_path, path, styled=styled, log_func=log_func,
-                     extra_sheets=extra_sheets, clinic=cl, preloaded=preloaded)
+                     extra_sheets=extra_sheets, clinic=cl, preloaded=preloaded,
+                     global_min_n=global_min_n)
         results[cl] = path
     if log_func:
         log_func(f"Готово: создано {len(results)} файлов (по одному на клинику).")
     return results
 
 
-def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=None):
+def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=None,
+                          global_min_n=None):
     """Отдельный режим работы «Сравнение клиник».
 
     Строит только листы сравнения (таблица в стиле листа 3 + лист с
@@ -2096,6 +2510,9 @@ def run_clinic_comparison(input_path, output_path, spec, styled=True, log_func=N
         valid_clinics = list(known)
     spec = dict(spec)
     spec['clinics'] = valid_clinics
+    # порог значимости со главного окна (если в спецификации своего нет)
+    if global_min_n and not spec.get('min_n'):
+        spec['min_n'] = int(global_min_n)
     errs = validate_spec(spec, available_antibiotics=antibiotics)
     if errs:
         raise ValueError(errs[0])
@@ -2193,9 +2610,17 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                 sheet4_df.to_excel(writer, sheet_name='3', index=False, header=False)
 
         # Листы конструктора (табличные — с шапкой; листы графиков и
-        # матрицы сравнения пишутся «как есть», без pandas-шапки)
+        # матрицы пишутся «как есть», без pandas-шапки). Матричные листы:
+        # «… (матрица)»/«… (матрица-микробы)» из режима сравнения и листы
+        # конструктора в режиме «Матрица» (имена «Имя (микробы)» /
+        # «Имя (микроб×материал)»).
+        def _is_matrix_sheet(nm):
+            return ('(матрица' in nm or '(микробы)' in nm
+                    or '(микроб×материал)' in nm)
+
         plain_sheets = set(chart_sheets) | {n for n in user_sheets
-                                            if n.endswith('(матрица)')}
+                                            if _is_matrix_sheet(n)}
+        matrix_user_names = [n for n in user_sheets if _is_matrix_sheet(n)]
         for name, df_sheet in user_sheets.items():
             df_sheet.to_excel(writer, sheet_name=name[:31], index=False,
                               header=False if name in plain_sheets else True)
@@ -2211,9 +2636,7 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                 extra_sheets.append('Данные')
             _apply_styling(writer, sheet2_df, sheet3_dict, sheet4_df, extra_sheets,
                            base_sheets=base_sheets,
-                           skip_sheets=set(chart_sheets) |
-                                       {n for n in user_sheets
-                                        if n.endswith('(матрица)')})
+                           skip_sheets=set(chart_sheets) | set(matrix_user_names))
 
         else:
             # Автонастройка ширины столбцов (как в базовой версии)
@@ -2238,12 +2661,23 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
         for name in chart_sheets:
             if name in writer.sheets:
                 _style_compare_chart_sheet(writer.sheets[name])
-        # Оформление листа «матрица» сравнения клиников (тепловая шкала S% + легенда)
+        # Оформление листов «матрица» сравнения клиников (тепловая шкала S% +
+        # легенда) — каждый лист получает свои метаданные по имени.
         for name in chart_sheets:
-            matrix_nm = name[:-len('(графики)')] + '(матрица)' \
-                if name.endswith('(графики)') else None
-            if matrix_nm and matrix_nm in writer.sheets:
-                _style_compare_matrix(writer.sheets[matrix_nm], compare_meta)
+            base_nm = name[:-len('(графики)')] if name.endswith('(графики)') else None
+            if not base_nm:
+                continue
+            for suffix in ('(матрица)', '(матрица-микробы)'):
+                target = next((s for s in writer.sheets if s.endswith(suffix)), None)
+                if target:
+                    _style_compare_matrix(writer.sheets[target], compare_meta,
+                                          sheet_name=target)
+        # Матрицы конструктора (режим «Матрица…»): тот же тепловой стиль и
+        # легенда, что у матриц сравнения (метаданные листа — из meta билдера)
+        for nm in matrix_user_names:
+            if nm in writer.sheets:
+                _style_compare_matrix(writer.sheets[nm], compare_meta,
+                                      sheet_name=nm)
 
         # Графики сравнения клиник (листы «… (графики)»)
         for name in chart_sheets:
@@ -2340,18 +2774,33 @@ def _autofit_sheet(ws, max_width=50):
         ws.column_dimensions[gcl(col)].width = min(length + 2.5, max_width)
 
 
-def _style_compare_matrix(ws, compare_meta=None):
-    """Оформление листа «… (матрица)» сравнения клиник.
+def _style_compare_matrix(ws, compare_meta=None, sheet_name=None):
+    """Оформление листа-матрицы (режим «Сравнение клиник» и листы-матрицы
+    конструктора).
 
     Тепловая цветовая шкала S% (чем выше чувствительность — тем зеленее),
     подсветка Max−min (красный ≥20 п.п., зелёный ≤5 п.п.), шапки блоков,
     автоширина и заморозка левого столбца с подписями строк. Под таблицей
-    размещается легенда: цветовая шкала S%, обозначения ячеек («нет теста»,
-    «нет посевов», «*» при малом n) и формулы колонок Max−min / «Разница».
+    размещается легенда: цветовая шкала, обозначения ячеек («нет теста»,
+    «нет посевов») и формулы колонок Max−min / «Разница».
     В легенду попадают только те обозначения, которые реально встретились
-    в листе (compare_meta['matrix_statuses']).
+    в листе (compare_meta['matrix_statuses']). Для листов конструктора
+    метаданные берутся из compare_meta['matrix_sheet_meta'][sheet_name].
+
+    Лист может содержать заголовок блока («Матрица сравнения клиник: …»),
+    строки «Антибиотик: …» и несколько вариантов подписей левого столбца
+    («Микроорганизм / материал» и «Микроорганизм») — все они распознаются.
     """
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    meta = dict(compare_meta or {})
+    if sheet_name:
+        meta = {**meta, **(meta.get('matrix_sheet_meta') or {}).get(sheet_name, {})}
+
+    # подписи левого столбца шапки, которые считаем началом таблицы блока
+    labels = set(meta.get('matrix_labels') or
+                 ['Микроорганизм / материал', 'Микроорганизм'])
+    block_title = str(meta.get('matrix_block_title') or '')
 
     ACCENT = '1F4E79'
     thin = Side(style='thin', color='B7C3D0')
@@ -2371,7 +2820,15 @@ def _style_compare_matrix(ws, compare_meta=None):
                 ws.cell(row=r, column=c).fill = sec_fill
             r += 1
             continue
-        if v == 'Микроорганизм / материал':
+        if block_title and v and str(v).strip() == block_title.strip():
+            tc = ws.cell(row=r, column=1)
+            tc.font = Font(bold=True, color='FFFFFF', size=13)
+            tc.alignment = left_al
+            for c in range(1, ncols + 1):
+                ws.cell(row=r, column=c).fill = head_fill
+            r += 1
+            continue
+        if v in labels:
             _style_header_row(ws, r, ncols)
             hdr = [ws.cell(row=r, column=c).value for c in range(1, ncols + 1)]
             clinic_cols = [c for c in range(2, ncols + 1)
@@ -2468,8 +2925,8 @@ def _style_compare_matrix(ws, compare_meta=None):
         r += 1
 
     # --- легенда под таблицей -------------------------------------------------
-    statuses = set((compare_meta or {}).get('matrix_statuses') or [])
-    legend = _build_matrix_legend(statuses)
+    statuses = set(meta.get('matrix_statuses') or [])
+    legend = _build_matrix_legend(statuses, meta)
     lr = ws.max_row + 2
     title = ws.cell(row=lr, column=1, value='КАК ЧИТАТЬ МАТРИЦУ (легенда)')
     title.font = Font(bold=True, color=ACCENT, size=12)
@@ -2510,16 +2967,20 @@ def _style_compare_matrix(ws, compare_meta=None):
     ws.freeze_panes = 'B1'
 
 
-def _build_matrix_legend(statuses):
-    """Строки легенды листа «матрица»: шкала S%, обозначения, формулы.
+def _build_matrix_legend(statuses, meta=None):
+    """Строки легенды листа «матрица»: шкала, обозначения, формулы.
 
     Аргумент statuses — множество статусов ячеек, реально встречающихся
     в матрице; обозначения, которых в данных нет, в легенду не попадают.
+    meta — метаданные листа (matrix_row_label, matrix_min_n); по ним
+    легенда объясняет именно ту формулу и тот столбец, что на листе.
     Возвращает список кортежей (kind, payload, text).
     """
-    rows = [('section', None, 'Цвет ячейки — доля чувствительных (S%):')]
+    meta = meta or {}
+    row_label = str(meta.get('matrix_row_label') or 'Микроорганизм / материал')
+    min_n = int(meta.get('matrix_min_n') or 0)
+    rows = [('section', None, 'Цвет ячейки — доля «не устойчивых» микроорганизмов:')]
     for th, fg, fc in CMP_SCALES:
-        hi = ' и выше' if th == 80 else ''
         if th == 0:
             rng_txt = '< 20'
         else:
@@ -2533,37 +2994,48 @@ def _build_matrix_legend(statuses):
                       'FFC7CE': 'критически низкая (препарат практически не работает)'
                       }[fg]))
     rows.append(('section', None, 'Обозначения в ячейках:'))
-    rows.append(('cell', (f"12.3", None, None),
-                 'число — S% чувствительности (доля S от определённых S+I+R)'))
     rows.append(('cell', ("42.9% (n=14)", None, None),
-                 'n в скобках — число определений (S+I+R), из которых получен %'))
-    rows.append(('cell', ("нет данных", 'F2F2F2', '808080'),
-                 f"мало данных: определений меньше {CMP_MIN_SIGNIFICANT} — значение "
-                 "нестабильно, в сравнение и топ-различий не попадает"))
+                 'значение — доля «не устойчивых» по формуле (S + I) / (S + I + R) '
+                 '× 100; n в скобках — число определённых ответов (S + I + R), из '
+                 'которых получен процент'))
+    # порог значимости: 0/пусто означает «без порога», но одно определение
+    # (n = 1) всё равно является минимальным условием показа значения
+    eff_min_n = max(min_n, 1)
+    if eff_min_n > 1:
+        rows.append(('cell', ("нет теста", 'EDEDED', '808080'),
+                    f"применён порог значимости n ≥ {eff_min_n}: значения, полученные "
+                    f"менее чем на {eff_min_n} определениях, считаются ненадёжными и "
+                    "отображаются как «нет теста»"))
+    else:
+        rows.append(('line', None,
+                     'порог значимости не задан — в таблицу попадает любое число '
+                     'определений (минимум 1; оцените надёжность по «n» в скобках)'))
     if 'no_test' in statuses:
         rows.append(('cell', ("нет теста", 'EDEDED', '808080'),
-                    "посевы были, но данный антибиотик этой паре не испытывался "
-                    "(или определений меньше порога значимости)"))
+                    "посевы с этим набором были, но данный антибиотик паре "
+                    "«микроорганизм / материал» не испытывался"))
     if 'no_cultures' in statuses:
         rows.append(('cell', ("нет посевов", 'FFFFFF', 'A6A6A6'),
-                    'у клиники нет проб с таким микроорганизмом/материалом'))
+                    f"нет ни одного посева строки «{row_label}», к которому "
+                    "применялся бы этот антибиотик"))
     rows.append(('cell', ("▢", None, '404040'),
-                 'жирная рамка — лучшая и худшая клиника строки (среди протестированных)'))
+                 'жирная рамка — лучшее и худшее значение строки (среди тех, '
+                 'где есть данные)'))
     rows.append(('section', None, 'Формулы дополнительных колонок:'))
     rows.append(('line', None,
-                 'Max−min = максимальное S% − минимальное S% среди клиник, '
-                 'тестировавших антибиотик (п.п. — процентные пункты)'))
+                 'Max−min = максимальное значение − минимальное в строке '
+                 '(в процентных пунктах, п.п.)'))
     rows.append(('line', None,
-                 'подсветка Max−min: зелёная ≤ 5 п.п. (клиники согласуются), '
+                 'подсветка Max−min: зелёная ≤ 5 п.п. (значения согласуются), '
                  'красная ≥ 20 п.п. (существенное различие)'))
     rows.append(('line', None,
-                 '«Разница» — клиника с наибольшим S% (+величина различия и n) '
-                 'против клиники с наименьшим S% (n)'))
+                 '«Разница» — клиника/колонка с наибольшим значением (+величина '
+                 'различия и n) против наименьшего (n)'))
     rows.append(('line', None,
-                 'S% = S / (S + I + R) × 100, где S/I/R — определения по EUCAST; '
-                 'НД (неопределившие) из знаменателя исключаются; правило '
-                 'относится к листам СРАВНЕНИЯ клиник (в базовых листах «3» '
-                 'проценты считаются от Total = S + I + R + НД)'))
+                 'Итоговая формула листа: (S + I) / (S + I + R) × 100, где S/I/R — '
+                 'определения по EUCAST; «НД» (неопределившие) из расчёта исключены. '
+                 'ВНИМАНИЕ: в базовых листах «3» проценты считаются иначе — '
+                 'от Total = S + I + R + НД.'))
     return rows
 
 
@@ -2814,6 +3286,21 @@ def _add_comparison_charts(ws, log_func=None):
                     chart.dataLabels = DataLabelList()
                     chart.dataLabels.showVal = True
                     chart.dataLabels.numFmt = '0'
+                except Exception:
+                    pass
+                # подписи значений рисуем ВНУТРИ столбца белым жирным — так
+                # они не наслаиваются друг на друга при близких высотах
+                try:
+                    chart.dataLabels.dLblPos = 'inEnd'
+                    from openpyxl.chart.text import RichText
+                    from openpyxl.drawing.text import (RichTextProperties,
+                                                       Paragraph, ParagraphProperties,
+                                                       CharacterProperties)
+                    from openpyxl.drawing.text import Font as DrawFont
+                    cp = CharacterProperties(solidFill='FFFFFF', sz=800, b=True,
+                                             latin=DrawFont(typeface='Calibri'))
+                    chart.dataLabels.txPr = RichText(
+                        p=[Paragraph(pPr=ParagraphProperties(defRPr=cp), endParaRPr=cp)])
                 except Exception:
                     pass
                 chart.width = 24

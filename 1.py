@@ -215,6 +215,19 @@ class App(ctk.CTk):
                                          text_color=("gray40", "gray65"))
         self.builder_info.pack(side="left", padx=(2, 10))
 
+        # Порог значимости (единый для всех режимов): число определённых
+        # ответов S+I+R, ниже которого строка/ячейка не попадает в листы.
+        thr_frame = ctk.CTkFrame(actions, fg_color="transparent")
+        thr_frame.pack(side="right", padx=8)
+        ctk.CTkLabel(thr_frame, text="Порог значимости n≥",
+                     font=ctk.CTkFont(size=13)).pack(side="left", padx=(0, 4))
+        self.min_n_entry = ctk.CTkEntry(thr_frame, width=52, height=28)
+        self.min_n_entry.insert(0, "0")
+        self.min_n_entry.pack(side="left")
+        ctk.CTkLabel(thr_frame, text="(0 = без порога)",
+                     font=ctk.CTkFont(size=11),
+                     text_color=("gray45", "gray65")).pack(side="left", padx=(4, 0))
+
         self.styled_var = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(actions, text="Красивое оформление Excel (шапки, зебра, подсветка %)",
                       variable=self.styled_var, font=ctk.CTkFont(size=13)
@@ -413,6 +426,11 @@ class App(ctk.CTk):
             warn = "  ⚠️ отметьте минимум две клиники"
         self.cmp_info.configure(text=f"ℹ️ {abs_txt};  {cl_txt}{warn}")
 
+    def current_min_n(self):
+        """Порог значимости со главного окна (0 = без порога)."""
+        from app_core import parse_min_significant
+        return parse_min_significant(self.min_n_entry.get())
+
     def _build_compare_spec(self):
         """Спецификация листа для отдельного режима «Сравнение клиник»."""
         return {
@@ -422,6 +440,7 @@ class App(ctk.CTk):
             "antibiotics": self.selected_compare_antibiotics(),
             "compare_by": ["organism", "material_raw"],
             "filter": "positive_only",
+            "min_n": self.current_min_n(),
         }
 
     def _save_compare_settings(self):
@@ -528,6 +547,7 @@ class App(ctk.CTk):
             return
 
         styled = bool(self.styled_var.get())
+        min_n = self.current_min_n()
         compare_mode = self._is_compare_mode()
         specs = [] if compare_mode else list(self._sheet_specs)
 
@@ -559,21 +579,24 @@ class App(ctk.CTk):
                      f"Антибиотики: "
                      + (f"все ({len(self._antibiotics_cache)})" if not spec['antibiotics']
                         else ", ".join(spec['antibiotics']))
-                     + ". Базовые листы 1–3 не создаются.")
+                     + (f". Порог значимости: n≥{min_n}." if min_n else
+                        ". Порог значимости не применяется.")
+                     + " Базовые листы 1–3 не создаются.")
         else:
-            self.log(f"Клиника: {mode_txt}")
+            self.log(f"Клиника: {mode_txt}"
+                     + (f". Порог значимости: n≥{min_n}." if min_n else ""))
             if specs:
                 self.log(f"План: 3 базовых листа + {len(specs)} из конструктора: "
                          + ", ".join(s['name'] for s in specs))
 
         thread = threading.Thread(target=self._task,
                                   args=(input_path, output_path, styled, specs,
-                                        mode_txt, compare_mode, spec),
+                                        mode_txt, compare_mode, spec, min_n),
                                   daemon=True)
         thread.start()
 
     def _task(self, input_path, output_path, styled, specs, mode_txt,
-              compare_mode=False, compare_spec=None):
+              compare_mode=False, compare_spec=None, min_n=0):
         # Из фонового потока не трогаем Tk напрямую — только очередь и флаг.
         try:
             if compare_mode:
@@ -585,7 +608,7 @@ class App(ctk.CTk):
             elif mode_txt == ALL_CLINICS_LABEL:
                 results = run_pipeline_multi_clinic(
                     input_path, output_path, styled=styled, log_func=self.log,
-                    extra_sheets=specs)
+                    extra_sheets=specs, global_min_n=min_n)
                 listing = "; ".join(f"{cl}: {os.path.basename(p)}"
                                     for cl, p in results.items())
                 self._log_queue.put(f"Создано файлов: {len(results)} — {listing}")
@@ -596,7 +619,7 @@ class App(ctk.CTk):
                     else mode_txt
                 run_pipeline(input_path, output_path, styled=styled,
                              log_func=self.log, extra_sheets=specs,
-                             clinic=clinic)
+                             clinic=clinic, global_min_n=min_n)
                 self._log_queue.put(f"Результат сохранён: {output_path}")
             self._finished_ok = True
         except Exception as e:
