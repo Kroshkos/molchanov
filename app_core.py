@@ -1618,15 +1618,18 @@ def _cmp_pct_cols(ws, hdr_row):
 
 def get_compare_sheet_names(spec_name):
     """Имена листов режима сравнения: таблица + матрица (с материалом) +
-    матрица без разделения по материалам + графики.
+    матрица без разделения по материалам + лист данных графиков + графики.
 
-    Возвращает 4 имени в порядке листов: (таблица, матрица, матрица_орг,
-    графики). «Матрица-микробы» — вторая матрица сравнения без разделения
-    по материалам (строки — только микроорганизмы)."""
+    Возвращает 5 имён в порядке листов: (таблица, матрица, матрица_орг,
+    данные_графиков, графики). «Матрица-микробы» — вторая матрица сравнения
+    без разделения по материалам (строки — только микроорганизмы).
+    Лист «… (данные)» содержит таблицы S%, на которые ссылаются диаграммы;
+    лист «… (графики)» — чистые графики без таблиц."""
     base = sanitize_sheet_name(str(spec_name).strip())[:22] or 'Сравнение'
     return (base,
             sanitize_sheet_name(f'{base} (матрица)')[:31],
             sanitize_sheet_name(f'{base} (матрица-микробы)')[:31],
+            sanitize_sheet_name(f'{base} (данные)')[:31],
             sanitize_sheet_name(f'{base} (графики)')[:31])
 
 
@@ -2051,7 +2054,7 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         all_rows.pop()
     table_df = pd.DataFrame(all_rows)
 
-    tab_name, matrix_name, org_matrix_name, chart_name = get_compare_sheet_names(
+    tab_name, matrix_name, org_matrix_name, cdata_name, chart_name = get_compare_sheet_names(
         spec.get('name', 'Сравнение клиник'))
     result = {tab_name: table_df}
     # метаданные режима сравнения (используются стилями листов в save_to_excel)
@@ -2253,12 +2256,16 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
         table_df = pd.DataFrame(all_rows)
         result[tab_name] = table_df
 
-    # --- лист с графиками: S% по клиникам для одних и тех же наборов ---
+    # --- данные для графиков: S% по клиникам для одних и тех же наборов ---
     # Простые сравнимые графики: ОДИН график на антибиотик, категории —
     # микроорганизмы (материал вынесен в подпись), серии — клиники.
-    # В график попадают ТОЛЬКО значимые значения (n ≥ CMP_MIN_SIGNIFICANT):
-    # если у клиники по микроорганизму данных нет, столбец просто не рисуется
-    # (None), а не подставляется ложный «0%».
+    # Логика «только нужное»: на графике отображаются ТОЛЬКО те значения,
+    # которые реально есть для конкретной пары «антибиотик × микроорганизм»
+    # в конкретной клинике (значимые, n ≥ min_n). Лишних категорий нет:
+    # микроорганизм попадает в график только если хотя бы у двух клиник есть
+    # для него значение — иначе сравнивать не с чем и точки наслаиваются.
+    # Таблицы данных вынесены на отдельный лист «… (данные)», а сам лист
+    # «… (графики)» содержит только диаграммы.
     groups = []  # (ab, [orgs], {clinic: [S% or None]}, clinics_in_chart)
     by_ab = {}
     for ab, cl, items in chart_data:
@@ -2268,22 +2275,37 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             continue
         dmaps = {}
         for cl, items in by_ab[ab]:
-            pairs = {lbl.split(' | ')[0]: sv for lbl, sv, nv in items}
+            # подпись строки блока: «микроорганизм» или «микроорганизм | материал»;
+            # в категории графика попадает ВСЁ название набора — иначе разные
+            # материалы одного микроба сливаются в одну категорию и значения
+            # на графике начинают перекрывать друг друга
+            pairs = {lbl: sv for lbl, sv, nv in items}
             if pairs:
                 dmaps[cl] = pairs
         cl_list = [cl for cl in clinics if cl in dmaps]
         if len(cl_list) < 2:
             continue   # сравнивать не с чем — график не строим
         orgs = sorted({o for cl in cl_list for o in dmaps[cl]})
-        # приоритет: микроорганизмы, протестированные во всех клиниках
+        # приоритет: наборы, протестированные во всех клиниках
         common = [o for o in orgs if all(o in dmaps[cl] for cl in cl_list)]
         ordered = (common + [o for o in orgs if o not in set(common)])[:COMPARE_CHART_MAX_POINTS]
-        # убираем микроорганизмы без единого значения (не должны быть)
-        ordered = [o for o in ordered if any(o in dmaps[cl] for cl in cl_list)]
-        if not ordered:
+        # в график включаем только наборы как минимум с ДВУМЯ
+        # значениями по клиникам — при одном значении сравнение теряет смысл,
+        # а пустые ячейки-«дырки» портят читаемость осей и подписей
+        ordered = [o for o in ordered
+                   if sum(1 for cl in cl_list if dmaps[cl].get(o) is not None) >= 2]
+        if len(ordered) < 1:
+            continue
+        series = {cl: [dmaps[cl].get(o) for o in ordered] for cl in cl_list}
+        # клиники без единого значения в отобранных категориях убираем из серий
+        cl_list = [cl for cl in cl_list
+                   if any(v is not None for v in series[cl])]
+        if len(cl_list) < 2:
             continue
         series = {cl: [dmaps[cl].get(o) for o in ordered] for cl in cl_list}
         groups.append((ab, ordered, series, cl_list))
+    # ширина блока — по фактическому набору категорий (ncols листа может
+    # быть шире из-за блоков с другим числом микроорганизмов)
     group_rows = []
     for ab, labels, series, cl_list in groups:
         group_rows.append([f"Антибиотик: {ab}"] + [''] * len(labels))
@@ -2292,9 +2314,10 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
             row_vals = ['' if v is None else round(v, 1) for v in series[cl]]
             group_rows.append([cl] + row_vals)
         group_rows.append([''] * (len(labels) + 1))
-    while group_rows and all(c in ('', None) for c in group_rows[-1]):
-        group_rows.pop()
-    # лист графиков остаётся даже если графиков нет — с поясняющей строкой
+    max_cols = max((len(r_) for r_ in group_rows), default=0)
+    for r_ in group_rows:
+        r_.extend([''] * (max_cols - len(r_)))
+    # лист данных остаётся даже если графиков нет — с поясняющей строкой
     if group_rows:
         chart_df = pd.DataFrame(group_rows)
     else:
@@ -2306,8 +2329,13 @@ def build_clinic_comparison(spec, base_df, data, antibiotics, ab_indices, log_fu
     if log_func:
         log_func(f"Сравнение клиник «{spec.get('name')}»: {len(selected_abs)} антибиотик(ов), "
                  f"{len(clinics)} клиник ({', '.join(clinics)}), "
-                 f"{len(blocks)} блоков; листы: «{tab_name}», «{matrix_name}», «{chart_name}».")
-    result[chart_name] = chart_df
+                 f"{len(blocks)} блоков; листы: «{tab_name}», «{matrix_name}», "
+                 f"«{cdata_name}», «{chart_name}».")
+    result[cdata_name] = chart_df
+    # лист «графики» — только диаграммы (без таблицы); ссылки на данные
+    # ведут на лист «… (данные)»
+    result[chart_name] = pd.DataFrame()
+    compare_meta['chart_data_sheet'] = sanitize_sheet_name(cdata_name)[:31]
     return result, compare_meta
 
 
@@ -2396,6 +2424,10 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                         log_func=log_func)
                     compare_meta_all['matrix_statuses'] |= \
                         meta.get('matrix_statuses', set())
+                    # имя листа «… (данные)», на который ссылаются диаграммы —
+                    # нужно при добавлении графиков в save_to_excel
+                    if meta.get('chart_data_sheet'):
+                        compare_meta_all['chart_data_sheet'] = meta['chart_data_sheet']
                     # метаданные каждого листа сравнения (заголовки блоков,
                     # пороги) — для стиля конкретного листа по имени
                     for nm_m in dfs:
@@ -2418,7 +2450,11 @@ def run_pipeline(input_path, output_path, styled=True, log_func=None, extra_shee
                     log_func(f"Лист №{n}: {e} — лист пропущен.")
                 continue
             for raw_name, df_sheet in dfs.items():
-                if df_sheet is None or df_sheet.empty:
+                # лист «… (графики)» по определению пуст (на нём только
+                # диаграммы) — не пропускаем его при сборке имён листов
+                if df_sheet is None:
+                    continue
+                if df_sheet.empty and not str(raw_name).strip().endswith('(графики)'):
                     continue
                 nm = sanitize_sheet_name(str(raw_name).strip())
                 k = 1
@@ -2618,10 +2654,27 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
             return ('(матрица' in nm or '(микробы)' in nm
                     or '(микроб×материал)' in nm)
 
-        plain_sheets = set(chart_sheets) | {n for n in user_sheets
-                                            if _is_matrix_sheet(n)}
+        # листы «… (графики)» пишутся без pandas-шапки; пустой DataFrame
+        # тоже пишем — лист должен существовать даже без диаграмм.
+        # Сюда же относим имена из chart_sheets: в run_pipeline dict
+        # chart_sheets собирается по built_sheets, но если лист графиков
+        # пришёл только в chart_sheets — он всё равно должен рисоваться.
+        def _sheet_key(nm):
+            """Ключ листа в writer.sheets: pandas регистрирует лист по имени,
+            которое сам же усекает до 31 символа — сравниваем по тому же правилу."""
+            return str(nm)[:31]
+
+        chart_data_names = {_sheet_key(n)
+                            for n in user_sheets if n.endswith('(графики)')}
+        chart_data_names |= {_sheet_key(n) for n in chart_sheets}
+        plain_sheets = ({_sheet_key(n) for n in chart_sheets}
+                        | chart_data_names
+                        | {n for n in user_sheets if _is_matrix_sheet(n)})
         matrix_user_names = [n for n in user_sheets if _is_matrix_sheet(n)]
         for name, df_sheet in user_sheets.items():
+            if _sheet_key(name) in chart_data_names and (df_sheet is None or df_sheet.empty):
+                ws_tmp = writer.book.create_sheet(_sheet_key(name))  # чистый лист под графики
+                continue
             df_sheet.to_excel(writer, sheet_name=name[:31], index=False,
                               header=False if name in plain_sheets else True)
 
@@ -2654,13 +2707,38 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
                     adjusted_width = min(max_length + 2, 50)
                     worksheet.column_dimensions[column_letter].width = adjusted_width
 
-        # Оформление и графики листов сравнения клиник. Порядок важен:
-        # сначала оформляем лист «графики» (шапки, тепловая шкала S%), затем
-        # добавляем сами диаграммы — openpyxl сохраняет только те ячейки, к
-        # которым обращались до записи книги.
+        # Оформление и графики сравнения клиник. Порядок важен: сначала
+        # оформляем лист данных «… (данные)» (шапки, тепловая шкала S%),
+        # затем добавляем сами диаграммы на чистый лист «… (графики)» —
+        # openpyxl сохраняет только те ячейки, к которым обращались до записи
+        # книги. Диаграммы ссылаются на лист данных, поэтому сам лист
+        # «графики» содержит только картинки графиков, без таблиц.
         for name in chart_sheets:
-            if name in writer.sheets:
-                _style_compare_chart_sheet(writer.sheets[name])
+            ws_charts = writer.sheets.get(_sheet_key(name))
+            if ws_charts is not None:
+                base_nm = name[:-len('(графики)')] if name.endswith('(графики)') else None
+                data_sheet_name = None
+                if base_nm:
+                    cand = sanitize_sheet_name(f'{base_nm} (данные)')[:31]
+                    if cand in writer.sheets:
+                        data_sheet_name = cand
+                if data_sheet_name is None and compare_meta:
+                    cand = compare_meta.get('chart_data_sheet')
+                    if cand and cand in writer.sheets:
+                        data_sheet_name = cand
+                if data_sheet_name and data_sheet_name in writer.sheets:
+                    _style_compare_chart_sheet(writer.sheets[data_sheet_name])
+                # если листа данных нет (старые пресеты) — стилизуем сам лист
+                # графиков и рисуем диаграммы на нём
+                legacy_inplace = data_sheet_name is None or \
+                    data_sheet_name not in writer.sheets
+                if legacy_inplace:
+                    _style_compare_chart_sheet(ws_charts)
+                _add_comparison_charts(ws_charts, log_func=log_func,
+                                       data_ws=(writer.sheets[data_sheet_name]
+                                                if (data_sheet_name and
+                                                    data_sheet_name in writer.sheets)
+                                                else None))
         # Оформление листов «матрица» сравнения клиников (тепловая шкала S% +
         # легенда) — каждый лист получает свои метаданные по имени.
         for name in chart_sheets:
@@ -2678,11 +2756,6 @@ def save_to_excel(sheet2_df, sheet3_dict, sheet4_df, output_file,
             if nm in writer.sheets:
                 _style_compare_matrix(writer.sheets[nm], compare_meta,
                                       sheet_name=nm)
-
-        # Графики сравнения клиник (листы «… (графики)»)
-        for name in chart_sheets:
-            if name in writer.sheets:
-                _add_comparison_charts(writer.sheets[name], log_func=log_func)
 
     if log_func:
         log_func("Сохранение завершено.")
@@ -3154,13 +3227,15 @@ def _highlight_compare_sheet(ws):
 
 
 def _style_compare_chart_sheet(ws):
-    """Оформление листа «… (графики)» сравнения клиник.
+    """Оформление листа «… (данные)» сравнения клиник (таблицы S% для
+    диаграмм, которые рисуются на отдельном листе «… (графики)»).
 
     Блок данных каждого антибиотика: заголовок «Антибиотик: …», строка
     «Клиника | <микроорганизмы/материалы>», затем по строке на клинику с
-    S% (пустая ячейка — антибиотик не тестировался, в график не попадает).
-    Стиль: залитые шапки блоков, тепловая шкала S% по CMP_SCALES, серые
-    пустые ячейки, тонкие рамки, автоширина и заморозка подписей строк.
+    S% (пустая ячейка — антибиотик не тестировался либо n ниже порога,
+    в график это значение не попадает). Стиль: залитые шапки блоков,
+    тепловая шкала S% по CMP_SCALES, серые пустые ячейки, тонкие рамки,
+    автоширина и заморозка подписей строк.
     """
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -3217,40 +3292,53 @@ def _style_compare_chart_sheet(ws):
     ws.freeze_panes = 'B1'
 
 
-def _add_comparison_charts(ws, log_func=None):
-    """Добавляет столбчатые диаграммы на лист «… (графики)» сравнения клиник.
+def _add_comparison_charts(ws, log_func=None, data_ws=None):
+    """Добавляет столбчатые диаграммы сравнения клиник.
 
-    Структура листа (см. build_clinic_comparison): блок из трёх строк —
-    заголовок антибиотика, строка «Клиника | <диапазоны…>», затем по строке
-    на клинику со значениями S%. На каждый блок создаётся своя диаграмма
-    BarChart: оси категорий (микроорганизм/материал), серии-клиники в
-    единой цветовой палитре, лимит оси 0–100%, подписи значений над
-    столбцами, легенда справа. Диаграммы размещаются сеткой 2 в ряд, чтобы
-    лист был компактным и сопоставимым между антибиотиками.
-    """
+    Диаграммы всегда размещаются на листе ``ws`` (в новом режиме — чистом
+    листе «… (графики)» без таблиц). Данные берутся из блока структуры
+    (см. build_clinic_comparison): заголовок антибиотика, строка
+    «Клиника | <микроорганизмы…>», затем по строке на клинику со значениями
+    S%. Если передан ``data_ws`` — это лист «… (данные)» с той же сеткой
+    блоков: ссылки диаграмм строятся на него, а блоки ищутся в data_ws.
+    На каждый блок — своя BarChart: категории (микроорганизм/материал),
+    серии-клиники в единой цветовой палитре, лимит оси 0–100%, подписи
+    значений внутри столбцов, легенда справа. Диаграммы размещаются сеткой
+    2 в ряд. Пустые ячейки (антибиотик не тестировался / n ниже порога)
+    остаются разрывами — ложные «0%» не рисуются, лишние категории в график
+    не попадают."""
     from openpyxl.chart import BarChart, Reference
     from openpyxl.chart.label import DataLabelList
     from openpyxl.drawing.line import LineProperties
     from openpyxl.chart.shapes import GraphicalProperties
     from openpyxl.chart.series import SeriesLabel
 
+    src = data_ws if data_ws is not None else ws
     n_charts = 0
     r = 1
-    max_row = ws.max_row
+    max_row = src.max_row
     while r <= max_row:
-        a = ws.cell(row=r, column=1).value
-        b = ws.cell(row=r + 1, column=1).value if r + 1 <= max_row else None
+        a = src.cell(row=r, column=1).value
+        b = src.cell(row=r + 1, column=1).value if r + 1 <= max_row else None
         if a and b == 'Клиника':
             header_row = r + 1
             rr = r + 2
             last_data = rr - 1
             while last_data + 1 <= max_row:
-                v = ws.cell(row=last_data + 1, column=1).value
+                v = src.cell(row=last_data + 1, column=1).value
                 if v in (None, ''):
                     break
                 last_data += 1
-            ncols = ws.max_column
-            if last_data >= header_row + 1 and ncols >= 2:
+            ncols = src.max_column
+            # ширина блока — по фактическому числу категорий (не по max_column
+            # листа: блоки разных антибиотиков имеют разное число микроорганизмов,
+            # иначе серии «дотягиваются» пустыми столбцами до широкого блока)
+            block_ncols = 1
+            for cc in range(2, ncols + 1):
+                if src.cell(row=header_row, column=cc).value not in (None, ''):
+                    block_ncols = cc
+            if last_data >= header_row + 1 and block_ncols >= 2:
+                ncols = block_ncols
                 chart = BarChart()
                 chart.type = "col"
                 chart.grouping = "clustered"
@@ -3262,9 +3350,9 @@ def _add_comparison_charts(ws, log_func=None):
                 chart.y_axis.scaling.min = 0
                 chart.y_axis.scaling.max = 100
                 chart.y_axis.majorGridlines = None
-                data = Reference(ws, min_col=2, max_col=ncols,
+                data = Reference(src, min_col=2, max_col=ncols,
                                  min_row=header_row, max_row=last_data)
-                cats = Reference(ws, min_col=2, max_col=ncols,
+                cats = Reference(src, min_col=2, max_col=ncols,
                                  min_row=header_row, max_row=header_row)
                 chart.add_data(data, titles_from_data=False, from_rows=True)
                 chart.set_categories(cats)
@@ -3272,7 +3360,7 @@ def _add_comparison_charts(ws, log_func=None):
                 # цвета клиник (одинаковые во всех графиках набора)
                 series_names = []
                 for sr in range(header_row + 1, last_data + 1):
-                    v = ws.cell(row=sr, column=1).value
+                    v = src.cell(row=sr, column=1).value
                     series_names.append(str(v) if v not in (None, '') else f"Ряд {len(series_names)+1}")
                 for i, (s, nm) in enumerate(zip(chart.series, series_names)):
                     s.tx = SeriesLabel(v=nm)
@@ -3305,10 +3393,33 @@ def _add_comparison_charts(ws, log_func=None):
                     pass
                 chart.width = 24
                 chart.height = 11
-                # сетка размещения: 2 диаграммы в ряд, ниже блоков данных
+                # ссылки на данные — с именем листа-источника (кавычки по
+                # правилам Excel), иначе диаграмма ссылается на свой лист и
+                # при отдельном листе «графики» осталась бы пустой
+                src_title = str(src.title).replace("'", "''")
+                ref_sheet = f"'{src_title}'!"
+                last_letter = get_column_letter(block_ncols)
+                for s in chart.series:
+                    if s.val is not None and s.val.numRef is not None:
+                        s.val.numRef.f = (f"{ref_sheet}$B${header_row}:"
+                                          f"${last_letter}${last_data}")
+                    # категории задаются у каждой серии отдельно (у BarChart
+                    # нет общего атрибута cat)
+                    if getattr(s, 'cat', None) is not None:
+                        if s.cat.strRef is not None:
+                            s.cat.strRef.f = (f"{ref_sheet}$B${header_row}:"
+                                              f"${last_letter}${header_row}")
+                        elif s.cat.numRef is not None:
+                            s.cat.numRef.f = (f"{ref_sheet}$B${header_row}:"
+                                              f"${last_letter}${header_row}")
+                # сетка размещения: 2 диаграммы в ряд; при отдельном листе
+                # графиков считаем отступы в строках самого листа «графики»
                 grid_row = n_charts // 2
                 grid_col = 1 if n_charts % 2 == 0 else 13
-                anchor_row = last_data + 3 + grid_row * 23
+                if data_ws is not None:
+                    anchor_row = 1 + grid_row * 23
+                else:
+                    anchor_row = last_data + 3 + grid_row * 23
                 ws.add_chart(chart, f"{get_column_letter(grid_col)}{anchor_row}")
                 n_charts += 1
                 if n_charts >= COMPARE_CHART_MAX_BLOCKS:
